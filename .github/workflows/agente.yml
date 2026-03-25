@@ -1,0 +1,24 @@
+name: Il mio Agente IA
+
+on: [push] 
+
+jobs:
+  avvia-riparatore:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 1. Scarica il codice
+        uses: actions/checkout@v4
+        
+      - name: 2. Prepara Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          
+      - name: 3. Installa la libreria di Gemini
+        run: pip install google-genai
+        
+      - name: 4. Lancia l'Agente e passagli la chiave!
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python test_gemini.py
