@@ -5,6 +5,9 @@ import re
 import threading
 import difflib
 import stat
+import csv
+import time
+from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog
 from google import genai
@@ -54,13 +57,15 @@ class GitManager:
                 continue
         return content
 
+import time # Assicurati che 'time' sia importato in cima al file
+
 # ==========================================
 # MODULO GEN-AI CLOUD
 # ==========================================
 class GenAIClient:
     def __init__(self, api_key):
         self.client = genai.Client(api_key=api_key)
-        self.model_name = "gemini-2.5-flash"
+        self.model_name = "gemini-1.5-flash" # Prova anche "gemini-1.5-pro" se flash è intasato
 
     def analyze_code(self, target_file, source_code, context_code=""):
         prompt = (
@@ -76,7 +81,63 @@ class GenAIClient:
             "   TEST_FILE_NAME: [nome file]\n"
             "   RUN_COMMAND: [comando di test es. pytest test.py]\n"
         )
-        return self.client.models.generate_content(model=self.model_name, contents=prompt).text
+        
+        # --- MECCANISMO DI RETRY (Tolleranza ai Guasti API) ---
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                return self.client.models.generate_content(model=self.model_name, contents=prompt).text
+            except Exception as e:
+                # Se l'errore è un 503 (Server Pieni), aspetta e riprova
+                if "503" in str(e) or "UNAVAILABLE" in str(e):
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 5  # Aspetta 5 secondi, poi 10...
+                        print(f"API di Google sature. Tentativo {attempt + 2} di {max_retries} tra {wait_time} secondi...")
+                        time.sleep(wait_time)
+                    else:
+                        raise Exception(f"I server di Google sono in down dopo {max_retries} tentativi. Errore: {e}")
+                else:
+                    raise e # Se è un errore di chiave API o altro, blocca subito
+# ==========================================
+# MODULO TELEMETRIA (Salvataggio Metriche)
+# ==========================================
+class ExperimentLogger:
+    LOG_FILE = "thesis_metrics.csv"
+
+    @staticmethod
+    def initialize():
+        """Inizializza il CSV se non esiste, utile per raccogliere i dati per la tesi."""
+        if not os.path.exists(ExperimentLogger.LOG_FILE):
+            try:
+                with open(ExperimentLogger.LOG_FILE, mode='w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        "Timestamp", 
+                        "File Analizzato", 
+                        "Esito LLM", 
+                        "Stato Test Locale", 
+                        "Azione Utente", 
+                        "Tempo AI (sec)"
+                    ])
+            except Exception as e:
+                print(f"Errore creazione logger: {e}")
+
+    @staticmethod
+    def log_run(target_file, llm_status, test_status, human_action, response_time):
+        """Aggiunge una riga al file CSV con i risultati del test corrente."""
+        try:
+            with open(ExperimentLogger.LOG_FILE, mode='a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    os.path.basename(target_file) if target_file else "N/A",
+                    llm_status,
+                    test_status,
+                    human_action,
+                    round(response_time, 2)
+                ])
+        except Exception as e:
+            print(f"Errore nel salvataggio della telemetria: {e}")
 
 # ==========================================
 # CLASSE PRINCIPALE GUI (Human-in-the-Loop)
@@ -93,6 +154,12 @@ class GitAgentApp(ctk.CTk):
 
         self.fixed_code = ""
         self.target_file = ""
+        
+        # Variabili di stato per la telemetria
+        ExperimentLogger.initialize()
+        self.start_time = time.time()
+        self.llm_status = "In attesa"
+        self.test_status = "N/A"
 
         self.lbl_title = ctk.CTkLabel(self, text="Code Review", font=ctk.CTkFont(size=22, weight="bold"))
         self.lbl_title.pack(pady=(20, 10))
@@ -125,17 +192,21 @@ class GitAgentApp(ctk.CTk):
     def safe_btn_state(self, btn, state):
         self.after(0, lambda: btn.configure(state=state))
 
-    def approve_push(self):
+    def _log_and_exit(self, exit_code, human_action):
+        """Helper per salvare le metriche prima di chiudere"""
+        elapsed = time.time() - self.start_time
+        ExperimentLogger.log_run(self.target_file, self.llm_status, self.test_status, human_action, elapsed)
         self.destroy()
-        os._exit(0)
+        os._exit(exit_code)
+
+    def approve_push(self):
+        self._log_and_exit(0, "Push Approvato")
 
     def block_push(self):
-        self.destroy()
-        os._exit(1)
+        self._log_and_exit(1, "Push Bloccato")
 
     def bypass_hook(self):
-        self.destroy()
-        os._exit(0)
+        self._log_and_exit(0, "Bypass (Finestra chiusa)")
 
     def show_diff_viewer(self):
         if not self.fixed_code or not self.target_file: return
@@ -152,7 +223,7 @@ class GitAgentApp(ctk.CTk):
         popup = ctk.CTkToplevel(self)
         popup.title("Diff Viewer")
         popup.geometry("750x500")
-        popup.grab_set() # Blocca la finestra principale finché il popup è aperto
+        popup.grab_set() 
         
         txt = ctk.CTkTextbox(popup, width=700, height=350, font=("Courier", 12))
         txt.pack(pady=20)
@@ -164,6 +235,11 @@ class GitAgentApp(ctk.CTk):
             self.safe_log(f"File {self.target_file} patchato con successo. Esegui un nuovo commit.")
             self.safe_btn_state(self.btn_approve, "disabled")
             self.safe_btn_state(self.btn_fix, "disabled")
+            
+            # Registra l'azione specifica di applicazione patch
+            elapsed = time.time() - self.start_time
+            ExperimentLogger.log_run(self.target_file, self.llm_status, self.test_status, "Patch Applicata", elapsed)
+            
             popup.destroy()
 
         ctk.CTkButton(popup, text="Applica Patch", fg_color="green", command=apply_changes).pack(side="left", padx=50, pady=10)
@@ -173,8 +249,9 @@ class GitAgentApp(ctk.CTk):
         try:
             api_key = os.getenv('GOOGLE_API_KEY')
             if not api_key:
+                self.llm_status = "Errore API Key"
                 self.safe_log("Errore: GOOGLE_API_KEY non configurata nelle variabili d'ambiente.")
-                self.safe_btn_state(self.btn_approve, "normal") # Permette il bypass
+                self.safe_btn_state(self.btn_approve, "normal") 
                 return
 
             modified_files = GitManager.get_modified_files()
@@ -182,15 +259,14 @@ class GitAgentApp(ctk.CTk):
             target_files = [f for f in modified_files if f.endswith(valid_extensions)]
 
             if not target_files:
+                self.llm_status = "Nessun file supportato"
                 self.safe_log("Nessun file sorgente modificato. Push consentito.")
                 self.safe_btn_state(self.btn_approve, "normal")
-                self.approve_push() # Auto-push se non c'è codice da analizzare
                 return
 
             self.target_file = target_files[0]
             source_code = GitManager.read_files([self.target_file])
             
-            # Estrazione contesto (Focal Method)
             context_files = GitManager.get_context_files(self.target_file)
             context_code = GitManager.read_files(context_files) if context_files else "Nessun contesto aggiuntivo."
 
@@ -199,7 +275,6 @@ class GitAgentApp(ctk.CTk):
             ai_client = GenAIClient(api_key)
             response_text = ai_client.analyze_code(self.target_file, source_code, context_code)
 
-            # Debug report locale
             with open("REVIEW_REPORT.md", "w", encoding="utf-8") as report:
                 report.write(response_text)
 
@@ -211,9 +286,11 @@ class GitAgentApp(ctk.CTk):
             t_file_match = re.search(r"TEST_FILE_NAME:\s*(\S+)", response_text)
 
             if "Nessun bug" in response_text or "nessun bug" in response_text.lower():
+                self.llm_status = "Nessun Bug Rilevato"
                 self.safe_log("L'AI non ha rilevato falle logiche. Push consentito.")
                 self.safe_btn_state(self.btn_approve, "normal")
             elif cmd_match and t_file_match:
+                self.llm_status = "Bug Rilevato"
                 cmd = cmd_match.group(1).strip()
                 t_file = t_file_match.group(1).strip()
                 
@@ -227,14 +304,16 @@ class GitAgentApp(ctk.CTk):
                     res = subprocess.run(exec_cmd, shell=True, capture_output=True, text=True)
 
                     if res.returncode == 0:
-                        self.safe_log("La patch proposta ha superato gli Unit Test in ambiente locale.")
-                        self.safe_btn_state(self.btn_fix, "normal") # Abilita visione e iniezione
+                        self.test_status = "Passato"
+                        self.safe_log("La patch proposta ha superato gli Unit Test in locale.")
+                        self.safe_btn_state(self.btn_fix, "normal")
                     else:
-                        self.safe_log(f"Allarme Overfitting: La patch generata fallisce i test!\nLog: {res.stderr[:200]}")
-                        # Mostra comunque la patch ma avvisa lo sviluppatore
+                        self.test_status = "Fallito (Possibile Overfitting)"
+                        self.safe_log(f"Allarme: La patch generata fallisce i test!\nLog: {res.stderr[:200]}")
                         self.safe_btn_state(self.btn_fix, "normal")
 
         except Exception as e: 
+            self.llm_status = "Errore di Sistema"
             self.safe_log(f"Eccezione di sistema: {e}")
             self.safe_btn_state(self.btn_approve, "normal")
 
