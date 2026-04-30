@@ -19,13 +19,45 @@ import customtkinter as ctk
 class GitManager:
     @staticmethod
     def get_modified_files():
-        """Estrae l'elenco dei file modificati nel commit corrente."""
+        """
+        Estrae l'elenco dei file, risolvendo percorsi assoluti e 
+        gestendo nativamente ridenominazioni o eliminazioni (Status D/R).
+        """
         try:
-            cmd = ['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD']
+            # 1. Trova la radice assoluta del progetto (infallibile)
+            root_cmd = ['git', 'rev-parse', '--show-toplevel']
+            root_res = subprocess.run(root_cmd, capture_output=True, text=True, check=True)
+            repo_root = root_res.stdout.strip()
+
+            # 2. Ottieni lo STATO esatto dei file (--name-status)
+            cmd = ['git', 'diff-tree', '--no-commit-id', '--name-status', '-r', 'HEAD']
             res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            files = res.stdout.strip().split('\n')
-            return [os.path.normpath(f) for f in files if f.strip()]
-        except Exception:
+            lines = res.stdout.strip().split('\n')
+            
+            valid_files = []
+            for line in lines:
+                if not line.strip(): continue
+                
+                parts = line.split('\t')
+                status = parts[0]
+                
+                # Se il file è stato eliminato (D), l'AI non deve analizzarlo
+                if status.startswith('D'):
+                    continue
+                
+                # Se è stato Rinominato (R), parts[-1] ci dà sempre il NUOVO nome
+                # Se è Modificato (M) o Aggiunto (A), parts[-1] ci dà il nome.
+                file_path = parts[-1] 
+                
+                full_path = os.path.abspath(os.path.join(repo_root, file_path))
+                
+                # Doppio controllo critico: il file deve esistere sul disco adesso
+                if os.path.exists(full_path) and os.path.isfile(full_path):
+                    valid_files.append(full_path)
+                    
+            return valid_files
+        except Exception as e:
+            print(f"Errore GitManager: {e}")
             return []
 
     @staticmethod
@@ -57,15 +89,13 @@ class GitManager:
                 continue
         return content
 
-import time # Assicurati che 'time' sia importato in cima al file
-
 # ==========================================
 # MODULO GEN-AI CLOUD
 # ==========================================
 class GenAIClient:
     def __init__(self, api_key):
         self.client = genai.Client(api_key=api_key)
-        self.model_name = "gemini-1.5-flash" # Prova anche "gemini-1.5-pro" se flash è intasato
+        self.model_name = "gemini-2.0-flash"  # Assicurati di usare il modello più stabile
 
     def analyze_code(self, target_file, source_code, context_code=""):
         prompt = (
@@ -88,53 +118,44 @@ class GenAIClient:
             try:
                 return self.client.models.generate_content(model=self.model_name, contents=prompt).text
             except Exception as e:
-                # Se l'errore è un 503 (Server Pieni), aspetta e riprova
-                if "503" in str(e) or "UNAVAILABLE" in str(e):
+                if "503" in str(e) or "UNAVAILABLE" in str(e) or "429" in str(e):
                     if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5  # Aspetta 5 secondi, poi 10...
+                        wait_time = (attempt + 1) * 5
                         print(f"API di Google sature. Tentativo {attempt + 2} di {max_retries} tra {wait_time} secondi...")
                         time.sleep(wait_time)
                     else:
                         raise Exception(f"I server di Google sono in down dopo {max_retries} tentativi. Errore: {e}")
                 else:
-                    raise e # Se è un errore di chiave API o altro, blocca subito
+                    raise e
+
 # ==========================================
-# MODULO TELEMETRIA (Salvataggio Metriche)
+# MODULO TELEMETRIA 
 # ==========================================
 class ExperimentLogger:
     LOG_FILE = "thesis_metrics.csv"
 
     @staticmethod
     def initialize():
-        """Inizializza il CSV se non esiste, utile per raccogliere i dati per la tesi."""
         if not os.path.exists(ExperimentLogger.LOG_FILE):
             try:
                 with open(ExperimentLogger.LOG_FILE, mode='w', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
                     writer.writerow([
-                        "Timestamp", 
-                        "File Analizzato", 
-                        "Esito LLM", 
-                        "Stato Test Locale", 
-                        "Azione Utente", 
-                        "Tempo AI (sec)"
+                        "Timestamp", "File Analizzato", "Esito LLM", 
+                        "Stato Test Locale", "Azione Utente", "Tempo AI (sec)"
                     ])
             except Exception as e:
                 print(f"Errore creazione logger: {e}")
 
     @staticmethod
     def log_run(target_file, llm_status, test_status, human_action, response_time):
-        """Aggiunge una riga al file CSV con i risultati del test corrente."""
         try:
             with open(ExperimentLogger.LOG_FILE, mode='a', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     os.path.basename(target_file) if target_file else "N/A",
-                    llm_status,
-                    test_status,
-                    human_action,
-                    round(response_time, 2)
+                    llm_status, test_status, human_action, round(response_time, 2)
                 ])
         except Exception as e:
             print(f"Errore nel salvataggio della telemetria: {e}")
@@ -154,8 +175,8 @@ class GitAgentApp(ctk.CTk):
 
         self.fixed_code = ""
         self.target_file = ""
+        self.generated_test_code = "" # Memorizza il test per mostrarlo nella GUI
         
-        # Variabili di stato per la telemetria
         ExperimentLogger.initialize()
         self.start_time = time.time()
         self.llm_status = "In attesa"
@@ -180,12 +201,9 @@ class GitAgentApp(ctk.CTk):
         self.btn_fix.grid(row=0, column=2, padx=10)
 
         self.safe_log("Avvio analisi automatica del commit...")
-        
-        # Esecuzione asincrona per non bloccare la GUI
         threading.Thread(target=self.run_agent_logic, daemon=True).start()
 
     def safe_log(self, text):
-        """Metodo thread-safe per aggiornare la GUI dal thread asincrono"""
         self.after(0, lambda: self.log_box.insert("end", text + "\n"))
         self.after(0, lambda: self.log_box.see("end"))
 
@@ -193,7 +211,6 @@ class GitAgentApp(ctk.CTk):
         self.after(0, lambda: btn.configure(state=state))
 
     def _log_and_exit(self, exit_code, human_action):
-        """Helper per salvare le metriche prima di chiudere"""
         elapsed = time.time() - self.start_time
         ExperimentLogger.log_run(self.target_file, self.llm_status, self.test_status, human_action, elapsed)
         self.destroy()
@@ -221,29 +238,42 @@ class GitAgentApp(ctk.CTk):
         diff_output = "".join(difflib.unified_diff(old_code, new_code, fromfile='Originale', tofile='Patch AI'))
 
         popup = ctk.CTkToplevel(self)
-        popup.title("Diff Viewer")
-        popup.geometry("750x500")
+        popup.title("Review Dettagliata (Diff & Unit Test)")
+        popup.geometry("800x700")
         popup.grab_set() 
         
-        txt = ctk.CTkTextbox(popup, width=700, height=350, font=("Courier", 12))
-        txt.pack(pady=20)
-        txt.insert("0.0", diff_output if diff_output else "Nessuna differenza strutturale.")
+        # --- SEZIONE 1: DIFF DELLA PATCH ---
+        ctk.CTkLabel(popup, text="Patch Proposta (Codice Sorgente)", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 0))
+        txt_diff = ctk.CTkTextbox(popup, width=750, height=250, font=("Courier", 12))
+        txt_diff.pack(pady=5)
+        txt_diff.insert("0.0", diff_output if diff_output else "Nessuna differenza strutturale.")
+        
+        # --- SEZIONE 2: UNIT TEST GENERATO ---
+        ctk.CTkLabel(popup, text="Unit Test Generato dall'AI", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 0))
+        txt_test = ctk.CTkTextbox(popup, width=750, height=200, font=("Courier", 12))
+        txt_test.pack(pady=5)
+        txt_test.insert("0.0", self.generated_test_code if self.generated_test_code else "Nessun test rilevato.")
         
         def apply_changes():
-            with open(self.target_file, "w", encoding="utf-8") as f:
+            absolute_path = os.path.abspath(self.target_file)
+            with open(absolute_path, "w", encoding="utf-8") as f:
                 f.write(self.fixed_code)
-            self.safe_log(f"File {self.target_file} patchato con successo. Esegui un nuovo commit.")
+            
+            self.safe_log(f"FILE SOVRASCRITTO: {os.path.basename(absolute_path)}")
+            self.safe_log("Il push è stato BLOCCATO in sicurezza. Fai un nuovo commit e riprova il push.")
             self.safe_btn_state(self.btn_approve, "disabled")
             self.safe_btn_state(self.btn_fix, "disabled")
             
-            # Registra l'azione specifica di applicazione patch
-            elapsed = time.time() - self.start_time
-            ExperimentLogger.log_run(self.target_file, self.llm_status, self.test_status, "Patch Applicata", elapsed)
+            self.test_status = "Patch Applicata - Richiesto nuovo commit"
             
             popup.destroy()
+            # Forza la chiusura del programma con errore dopo 2 secondi per bloccare il push originario
+            self.after(2000, lambda: self._log_and_exit(1, "Patch Applicata"))
 
-        ctk.CTkButton(popup, text="Applica Patch", fg_color="green", command=apply_changes).pack(side="left", padx=50, pady=10)
-        ctk.CTkButton(popup, text="Annulla", fg_color="gray", command=popup.destroy).pack(side="right", padx=50, pady=10)
+        btn_frame_popup = ctk.CTkFrame(popup, fg_color="transparent")
+        btn_frame_popup.pack(pady=15)
+        ctk.CTkButton(btn_frame_popup, text="Applica Patch", fg_color="green", command=apply_changes).pack(side="left", padx=20)
+        ctk.CTkButton(btn_frame_popup, text="Annulla", fg_color="gray", command=popup.destroy).pack(side="right", padx=20)
 
     def run_agent_logic(self):
         try:
@@ -296,8 +326,9 @@ class GitAgentApp(ctk.CTk):
                 
                 blocks = re.findall(r"```[^\n]*\n(.*?)\n```", response_text, re.DOTALL)
                 if blocks:
+                    self.generated_test_code = blocks[-1].strip() # Salva il test per la GUI
                     with open(t_file, "w", encoding="utf-8") as f: 
-                        f.write(blocks[-1])
+                        f.write(self.generated_test_code)
                     
                     self.safe_log(f"Falla logica rilevata. Avvio validazione deterministica: {cmd}")
                     exec_cmd = f"{sys.executable} -m {cmd}" if cmd.startswith("pytest") else cmd
