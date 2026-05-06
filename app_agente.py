@@ -1,69 +1,143 @@
-import os
-import sys
-import subprocess
-import re
-import threading
-import difflib
 import csv
-import time
-import stat
+import difflib
+import os
+import re
+import shlex
 import shutil
+import stat
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+from typing import Iterable, List, Optional, Tuple
+
 import tkinter as tk
 from tkinter import filedialog
-from google import genai
+
 import customtkinter as ctk
+from google import genai
 
-# ──────────────────────────────────────────────
-# CONFIGURAZIONE GLOBALE
-# ──────────────────────────────────────────────
-BYPASS_ENV_VAR        = "AI_AGENT_BYPASS"
-BYPASS_TTL_SECONDS    = 120          # il bypass file scade dopo 2 minuti
-DIFF_CONTEXT_LINES    = 8
+
+# ============================================================================
+# CONFIGURAZIONE GENERALE
+# ============================================================================
+
+BYPASS_ENV_VAR = "AI_AGENT_BYPASS"
+BYPASS_TTL_SECONDS = 120
+DIFF_CONTEXT_LINES = 8
 API_KEY_FALLBACK_FILE = ".api_key"
-MAX_RETRY_ATTEMPTS    = 3
+MAX_FILE_SIZE_BYTES = 150 * 1024
+MAX_FILE_LINES = 2000
+MAX_RETRY_ATTEMPTS = 3
+MAX_FILES_TO_ANALYZE = 10
+TEST_TIMEOUT_SECONDS = 30
+
+ZERO_SHA_RE = re.compile(r"^0+$")
 
 
-# ──────────────────────────────────────────────
-# BYPASS HOOK
-# ──────────────────────────────────────────────
-def check_and_clear_bypass():
-    """
-    Verifica se il flag di bypass è attivo e, se presente, lo consuma.
+# ============================================================================
+# FUNZIONI DI SUPPORTO PER GIT E PROCESSI
+# ============================================================================
 
-    Il meccanismo primario è un file fisico in .git/ai_agent_bypass:
-    sopravvive alla terminazione del processo Python e viene letto dal
-    processo figlio avviato dal successivo 'git push'. La variabile
-    d'ambiente è mantenuta come fallback ma non è affidabile tra processi
-    distinti (es. Git Bash, SourceTree).
 
-    Il bypass file include un timestamp UNIX: viene accettato solo se
-    scritto negli ultimi BYPASS_TTL_SECONDS secondi, evitando che un file
-    rimasto orfano (es. crash di rete durante il secondo push) salti
-    indefinitamente le analisi future.
-    """
+def run_process(
+    args: List[str],
+    cwd: Optional[Path] = None,
+    timeout: Optional[int] = None,
+    env: Optional[dict] = None,
+) -> subprocess.CompletedProcess:
+    """Esegue un comando senza shell, cosi da ridurre il rischio di injection."""
+    return subprocess.run(
+        args,
+        cwd=str(cwd) if cwd else None,
+        shell=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+    )
+
+
+def git_output(args: List[str], cwd: Optional[Path] = None) -> Optional[str]:
+    """Restituisce stdout di un comando git, oppure None in caso di errore."""
     try:
-        res = subprocess.run(
-            ['git', 'rev-parse', '--git-dir'],
-            capture_output=True, text=True, check=True
-        )
-        bypass_file = os.path.join(res.stdout.strip(), "ai_agent_bypass")
-        if os.path.exists(bypass_file):
-            try:
-                with open(bypass_file, "r") as f:
-                    written_at = float(f.read().strip())
-                age = time.time() - written_at
-                os.remove(bypass_file)
-                if age <= BYPASS_TTL_SECONDS:
-                    return True
-                print(f"[Agente AI] Bypass file scaduto ({int(age)}s > {BYPASS_TTL_SECONDS}s), analisi riparte.")
-            except (ValueError, OSError):
-                try:
-                    os.remove(bypass_file)
-                except OSError:
-                    pass
+        res = run_process(["git"] + args, cwd=cwd)
+        if res.returncode == 0:
+            return res.stdout.strip()
     except Exception:
         pass
+    return None
+
+
+def get_git_dir() -> Optional[Path]:
+    """
+    Restituisce la directory .git reale.
+
+    Nei worktree moderni .git puo essere un file di puntamento, quindi si usa
+    prima --absolute-git-dir e solo dopo si ripiega su --git-dir.
+    """
+    out = git_output(["rev-parse", "--absolute-git-dir"])
+    if not out:
+        out = git_output(["rev-parse", "--git-dir"])
+    if not out:
+        return None
+
+    git_dir = Path(out)
+    if not git_dir.is_absolute():
+        git_dir = (Path.cwd() / git_dir).resolve()
+    return git_dir
+
+
+def get_repo_root() -> Optional[Path]:
+    out = git_output(["rev-parse", "--show-toplevel"])
+    return Path(out).resolve() if out else None
+
+
+def to_git_path(path: Path, repo_root: Path) -> str:
+    """Converte un percorso locale nel formato pathspec usato da Git."""
+    try:
+        return path.resolve().relative_to(repo_root.resolve()).as_posix()
+    except ValueError:
+        return path.resolve().as_posix()
+
+
+# ============================================================================
+# GESTIONE DEL BYPASS HOOK
+# ============================================================================
+
+
+def check_and_clear_bypass() -> bool:
+    """
+    Consuma un eventuale flag di bypass scritto nella directory .git.
+
+    Il timestamp evita che un bypass rimasto sul disco per errore faccia saltare
+    controlli futuri in modo silenzioso.
+    """
+    git_dir = get_git_dir()
+    if git_dir:
+        bypass_file = git_dir / "ai_agent_bypass"
+        if bypass_file.exists():
+            try:
+                written_at = float(bypass_file.read_text(encoding="utf-8").strip())
+                bypass_file.unlink(missing_ok=True)
+
+                age = time.time() - written_at
+                if age <= BYPASS_TTL_SECONDS:
+                    return True
+
+                print(
+                    "[Agente AI] Bypass ignorato perche scaduto "
+                    f"({int(age)}s > {BYPASS_TTL_SECONDS}s)."
+                )
+            except Exception:
+                try:
+                    bypass_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     if os.environ.get(BYPASS_ENV_VAR) == "1":
         return True
@@ -71,416 +145,695 @@ def check_and_clear_bypass():
     return False
 
 
-def set_bypass_flag():
-    """
-    Scrive il flag di bypass in .git/ con il timestamp corrente.
-    È l'unico metodo affidabile per comunicare il bypass al processo
-    figlio del successivo 'git push'.
-    """
+def set_bypass_flag() -> None:
+    """Scrive il flag usato per evitare il loop dopo un commit automatico."""
+    git_dir = get_git_dir()
+    if not git_dir:
+        return
     try:
-        res = subprocess.run(
-            ['git', 'rev-parse', '--git-dir'],
-            capture_output=True, text=True, check=True
-        )
-        bypass_file = os.path.join(res.stdout.strip(), "ai_agent_bypass")
-        with open(bypass_file, "w") as f:
-            f.write(str(time.time()))
+        (git_dir / "ai_agent_bypass").write_text(str(time.time()), encoding="utf-8")
     except Exception:
         pass
 
 
-# ──────────────────────────────────────────────
+# ============================================================================
 # RISOLUZIONE API KEY
-# ──────────────────────────────────────────────
-def resolve_api_key():
-    """
-    Risolve la API key con tre livelli di fallback progressivi:
-      1. Variabile d'ambiente GOOGLE_API_KEY  (standard)
-      2. File .api_key nella directory corrente
-      3. File .api_key nella root del repository Git
+# ============================================================================
 
-    Il supporto al file fisico è necessario perché Git Bash e alcune GUI
-    (SourceTree, GitKraken) non propagano le variabili d'ambiente di sistema
-    ai processi figli degli hook.
+
+def resolve_api_key(repo_root: Optional[Path] = None) -> Optional[str]:
+    """
+    Cerca la chiave API in tre posti:
+    1. variabile GOOGLE_API_KEY;
+    2. file .api_key nella directory corrente;
+    3. file .api_key nella root del repository.
     """
     key = os.getenv("GOOGLE_API_KEY")
-    if key:
+    if key and key.strip():
         return key.strip()
 
-    local_file = os.path.join(os.getcwd(), API_KEY_FALLBACK_FILE)
-    if os.path.exists(local_file):
-        try:
-            with open(local_file, "r", encoding="utf-8") as f:
-                key = f.read().strip()
-            if key:
-                return key
-        except Exception:
-            pass
+    candidates = [Path.cwd() / API_KEY_FALLBACK_FILE]
+    if repo_root:
+        repo_key = repo_root / API_KEY_FALLBACK_FILE
+        if repo_key not in candidates:
+            candidates.append(repo_key)
 
-    try:
-        res = subprocess.run(
-            ['git', 'rev-parse', '--show-toplevel'],
-            capture_output=True, text=True, check=True
-        )
-        repo_root_file = os.path.join(res.stdout.strip(), API_KEY_FALLBACK_FILE)
-        if os.path.exists(repo_root_file) and repo_root_file != local_file:
-            with open(repo_root_file, "r", encoding="utf-8") as f:
-                key = f.read().strip()
-            if key:
-                return key
-    except Exception:
-        pass
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                key = candidate.read_text(encoding="utf-8").strip()
+                if key:
+                    return key
+        except Exception:
+            continue
 
     return None
 
 
-# ──────────────────────────────────────────────
-# GIT MANAGER
-# ──────────────────────────────────────────────
+# ============================================================================
+# GESTORE REPOSITORY GIT
+# ============================================================================
+
+
+@dataclass
+class SizeCheck:
+    too_large: bool
+    reason: str = ""
+
+
 class GitManager:
+    SOURCE_EXTENSIONS = (".py", ".dart", ".swift", ".js", ".ts", ".java", ".cpp", ".c", ".cs")
+    EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
     @staticmethod
-    def get_modified_files():
+    def get_repo_root() -> Path:
+        return get_repo_root() or Path.cwd().resolve()
+
+    @staticmethod
+    def get_files_changed_by_push(pre_push_stdin: str) -> List[Path]:
         """
-        Restituisce i percorsi assoluti dei file aggiunti o modificati
-        nell'ultimo commit (HEAD), escludendo le cancellazioni.
+        Interpreta lo stdin del pre-push hook.
+
+        Ogni riga ha forma:
+        local_ref local_sha remote_ref remote_sha
+
+        Se lo script viene lanciato manualmente e non riceve stdin, si ripiega
+        sull'ultimo commit locale.
         """
+        repo_root = GitManager.get_repo_root()
+        changed: List[Path] = []
+
+        for line in pre_push_stdin.splitlines():
+            parts = line.strip().split()
+            if len(parts) != 4:
+                continue
+
+            _local_ref, local_sha, _remote_ref, remote_sha = parts
+            if ZERO_SHA_RE.match(local_sha):
+                continue
+
+            if ZERO_SHA_RE.match(remote_sha):
+                names = GitManager._diff_names([GitManager.EMPTY_TREE, local_sha], repo_root)
+            else:
+                names = GitManager._diff_names([f"{remote_sha}..{local_sha}"], repo_root)
+
+            for name in names:
+                changed.append((repo_root / name).resolve())
+
+        if not changed:
+            changed = GitManager.get_files_from_last_commit()
+
+        return GitManager._dedupe_existing_source_files(changed)
+
+    @staticmethod
+    def get_files_from_last_commit() -> List[Path]:
+        repo_root = GitManager.get_repo_root()
+        names = GitManager._diff_tree_names("HEAD", repo_root)
+        return GitManager._dedupe_existing_source_files((repo_root / n).resolve() for n in names)
+
+    @staticmethod
+    def _diff_names(args: List[str], repo_root: Path) -> List[str]:
+        res = run_process(["git", "diff", "--name-only", "--diff-filter=ACMR"] + args, cwd=repo_root)
+        if res.returncode != 0:
+            return []
+        return [line.strip() for line in res.stdout.splitlines() if line.strip()]
+
+    @staticmethod
+    def _diff_tree_names(commit: str, repo_root: Path) -> List[str]:
+        res = run_process(
+            [
+                "git",
+                "diff-tree",
+                "--no-commit-id",
+                "--root",
+                "--name-only",
+                "-r",
+                "--diff-filter=ACMR",
+                commit,
+            ],
+            cwd=repo_root,
+        )
+        if res.returncode != 0:
+            return []
+        return [line.strip() for line in res.stdout.splitlines() if line.strip()]
+
+    @staticmethod
+    def _dedupe_existing_source_files(paths: Iterable[Path]) -> List[Path]:
+        seen = set()
+        result: List[Path] = []
+
+        for path in paths:
+            try:
+                resolved = path.resolve()
+            except Exception:
+                continue
+
+            key = str(resolved).lower() if os.name == "nt" else str(resolved)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if resolved.exists() and resolved.is_file() and GitManager.is_source_file(resolved):
+                result.append(resolved)
+
+        return result
+
+    @staticmethod
+    def is_source_file(path: Path) -> bool:
+        return path.suffix.lower() in GitManager.SOURCE_EXTENSIONS
+
+    @staticmethod
+    def is_file_too_large(path: Path) -> SizeCheck:
+        """Controlla dimensione, numero righe e presenza di byte nulli."""
         try:
-            root_res = subprocess.run(
-                ['git', 'rev-parse', '--show-toplevel'],
-                capture_output=True, text=True, check=True
-            )
-            repo_root = root_res.stdout.strip()
+            size = path.stat().st_size
+        except OSError as exc:
+            return SizeCheck(True, f"stat non riuscito: {exc}")
 
-            res = subprocess.run(
-                ['git', 'diff-tree', '--no-commit-id', '--name-status', '-r', 'HEAD'],
-                capture_output=True, text=True, check=True
-            )
-            valid_files = []
-            for line in res.stdout.strip().split('\n'):
-                if not line.strip():
-                    continue
-                parts = line.split('\t')
-                if parts[0].startswith('D'):
-                    continue
-                full_path = os.path.abspath(os.path.join(repo_root, parts[-1]))
-                if os.path.exists(full_path) and os.path.isfile(full_path):
-                    valid_files.append(full_path)
-            return valid_files
-        except Exception:
-            return []
+        if size > MAX_FILE_SIZE_BYTES:
+            return SizeCheck(True, f"{size} byte > {MAX_FILE_SIZE_BYTES} byte")
+
+        try:
+            with path.open("rb") as f:
+                first_chunk = f.read(4096)
+                if b"\0" in first_chunk:
+                    return SizeCheck(True, "file probabilmente binario")
+
+                line_count = first_chunk.count(b"\n")
+                for chunk in iter(lambda: f.read(8192), b""):
+                    line_count += chunk.count(b"\n")
+                    if line_count > MAX_FILE_LINES:
+                        return SizeCheck(True, f"{line_count} righe > {MAX_FILE_LINES} righe")
+        except OSError as exc:
+            return SizeCheck(True, f"lettura non riuscita: {exc}")
+
+        return SizeCheck(False, "")
 
     @staticmethod
-    def get_context_files(target_file, max_files=3):
+    def get_context_files(target_file: Path, max_files: int = 3) -> List[Path]:
         """
-        Recupera fino a max_files file nella stessa directory con la stessa
-        estensione, da fornire come contesto architetturale all'LLM.
+        Prende pochi file vicini al target, con stessa estensione.
+
+        Il contesto e utile, ma deve restare piccolo per non gonfiare il prompt.
         """
-        target_dir = os.path.dirname(os.path.abspath(target_file))
-        target_ext = os.path.splitext(target_file)[1]
-        context_files = []
-        if not os.path.exists(target_dir):
-            return []
-        for f in os.listdir(target_dir):
-            full_path = os.path.join(target_dir, f)
-            if full_path == os.path.abspath(target_file):
+        target_dir = target_file.parent
+        target_ext = target_file.suffix.lower()
+        context_files: List[Path] = []
+
+        if not target_dir.exists():
+            return context_files
+
+        for candidate in sorted(target_dir.iterdir(), key=lambda p: p.name.lower()):
+            if candidate.resolve() == target_file.resolve():
                 continue
-            if not f.endswith(target_ext):
+            if not candidate.is_file() or candidate.suffix.lower() != target_ext:
                 continue
-            context_files.append(full_path)
+            if GitManager.is_file_too_large(candidate).too_large:
+                continue
+
+            context_files.append(candidate)
             if len(context_files) >= max_files:
                 break
+
         return context_files
 
     @staticmethod
-    def read_files(file_list):
-        """Concatena il contenuto dei file in una stringa strutturata per il prompt."""
-        content = ""
-        for file_name in file_list:
-            if not os.path.exists(file_name):
+    def read_files(file_list: Iterable[Path], repo_root: Optional[Path] = None) -> str:
+        blocks: List[str] = []
+        root = repo_root or GitManager.get_repo_root()
+
+        for file_path in file_list:
+            if not file_path.exists() or not file_path.is_file():
                 continue
+            if GitManager.is_file_too_large(file_path).too_large:
+                continue
+
+            text = GitManager._read_text_with_fallback(file_path)
+            if text is None:
+                continue
+
             try:
-                with open(file_name, "r", encoding="utf-8") as f:
-                    content += f"\n\n--- FILE: {os.path.basename(file_name)} ---\n{f.read()}\n"
+                label = to_git_path(file_path, root)
             except Exception:
+                label = file_path.name
+
+            blocks.append(f"\n\n--- FILE: {label} ---\n{text}\n")
+
+        return "".join(blocks)
+
+    @staticmethod
+    def _read_text_with_fallback(file_path: Path) -> Optional[str]:
+        for encoding in ("utf-8", "latin-1"):
+            try:
+                return file_path.read_text(encoding=encoding)
+            except UnicodeDecodeError:
                 continue
-        return content
+            except OSError:
+                return None
+        return None
+
+    @staticmethod
+    def has_worktree_changes(path: Path, repo_root: Path) -> bool:
+        try:
+            rel = to_git_path(path, repo_root)
+        except Exception:
+            rel = str(path)
+
+        res = run_process(["git", "diff", "--quiet", "--", rel], cwd=repo_root)
+        return res.returncode != 0
 
 
-# ──────────────────────────────────────────────
+# ============================================================================
 # CLIENT AI
-# ──────────────────────────────────────────────
+# ============================================================================
+
+
 class GenAIClient:
     MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"]
 
-    def __init__(self, api_key):
+    def __init__(self, api_key: str):
         self.client = genai.Client(api_key=api_key)
 
-    def analyze_code(self, target_file, source_code, context_code="", error_feedback=""):
-        """
-        Costruisce il prompt strutturato e lo invia all'API Gemini.
-        Se error_feedback è valorizzato, viene aggiunto in coda al prompt
-        per implementare il ciclo di Execution Feedback (Zhang et al., 2026).
-        In caso di errore temporaneo (503/429) ritenta una volta dopo 5s;
-        in caso di modello non disponibile (404) passa al successivo.
-        """
+    def analyze_code(
+        self,
+        target_file: Path,
+        source_code: str,
+        context_code: str = "",
+        error_feedback: str = "",
+    ) -> str:
+        prompt = self._build_prompt(target_file, source_code, context_code, error_feedback)
+
+        for model_name in self.MODELS:
+            print(f"[API] Connessione al modello: {model_name}")
+            for attempt in range(2):
+                try:
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                    )
+                    return response.text or ""
+                except Exception as exc:
+                    err = str(exc)
+                    if "404" in err:
+                        print(f"[API] Modello non disponibile: {model_name}.")
+                        break
+                    if any(marker in err for marker in ("503", "UNAVAILABLE", "429")):
+                        if attempt == 0:
+                            print("[API] Servizio temporaneamente saturo. Riprovo tra 5 secondi.")
+                            time.sleep(5)
+                            continue
+                        print(f"[API] Modello non raggiungibile: {model_name}.")
+                        break
+
+                    print(f"[API] Errore su {model_name}: {exc}")
+                    break
+
+        raise RuntimeError(
+            "Nessun modello Gemini disponibile. Controllare connessione e API key."
+        )
+
+    @staticmethod
+    def _build_prompt(
+        target_file: Path,
+        source_code: str,
+        context_code: str,
+        error_feedback: str,
+    ) -> str:
         prompt = (
-            "Sei un Code Reviewer automatizzato. Analizza il codice seguente:\n\n"
-            f"FILE TARGET: {target_file}\nCODICE TARGET:\n{source_code}\n\n"
+            "Sei un revisore automatico di codice per un progetto universitario.\n"
+            "Analizza solo difetti logici, bug reali e casi limite rilevanti. "
+            "Ignora stile, formattazione e preferenze personali.\n\n"
+            f"FILE TARGET: {target_file}\n"
+            f"CODICE TARGET:\n{source_code}\n\n"
             f"CONTESTO ARCHITETTURALE:\n{context_code}\n\n"
-            "REGOLE OPERATIVE:\n"
-            "1. Individua difetti logici nel FILE TARGET. Ignora stile e formattazione.\n"
-            "2. Se rilevi bug, fornisci: ## ANALISI DELL'ERRORE, ## CODICE CORRETTO e ## UNIT TEST.\n"
-            "3. Se non ci sono bug, scrivi 'Nessun bug' e fornisci uno script di test basilare.\n"
-            "4. I test devono essere script FLAT (nessun framework esterno, no pytest, no junit).\n"
-            "5. Lo script di test deve stampare le metriche esatte in questo formato:\n"
-            "   Passed: [numero]\n"
-            "   Failed: [numero]\n"
-            "   Usa sys.exit(1) in caso di fallimenti, sys.exit(0) se tutto passa.\n"
-            "6. Concludi SEMPRE con il blocco:\n"
-            "   DEPENDENCIES: NONE\n"
-            "   TEST_FILE_NAME: [nome file, es. test_fix.py]\n"
-            "   RUN_COMMAND: [comando shell di esecuzione, es. python test_fix.py]\n"
+            "Formato obbligatorio della risposta:\n"
+            "- Se trovi un bug, usa queste sezioni:\n"
+            "  ## ANALISI DELL'ERRORE\n"
+            "  ## CODICE CORRETTO\n"
+            "  ```linguaggio\n"
+            "  <file target completo corretto>\n"
+            "  ```\n"
+            "  ## UNIT TEST\n"
+            "  ```linguaggio\n"
+            "  <test flat e autonomo>\n"
+            "  ```\n"
+            "- Se non trovi bug, scrivi chiaramente 'Nessun bug' e fornisci comunque "
+            "un test basilare di convalida.\n\n"
+            "Vincoli sui test:\n"
+            "1. Niente framework esterni: no pytest, junit, database o servizi remoti.\n"
+            "2. Il test deve stampare esattamente queste metriche:\n"
+            "   Passed: <numero>\n"
+            "   Failed: <numero>\n"
+            "3. Il test deve terminare con exit code 0 se passa e non-zero se fallisce.\n"
+            "4. Non proporre comandi distruttivi o comandi che non eseguono il test.\n\n"
+            "Concludi sempre fuori dai blocchi di codice con:\n"
+            "DEPENDENCIES: NONE\n"
+            "TEST_FILE_NAME: <nome_file_test>\n"
+            "RUN_COMMAND: <comando_per_eseguire_il_test>\n"
         )
 
         if error_feedback:
             prompt += (
-                f"\n\n[FEEDBACK ESECUZIONE PRECEDENTE]\n"
-                f"Il test ha restituito il seguente errore:\n```\n{error_feedback}\n```\n"
-                f"Analizza l'errore, correggi il codice e assicurati di "
-                f"stampare Passed/Failed nel formato richiesto."
+                "\n\n[FEEDBACK ESECUZIONE PRECEDENTE]\n"
+                "Il test precedente non e stato eseguibile o non ha rispettato il formato.\n"
+                "Correggi risposta, test o patch mantenendo i vincoli sopra.\n"
+                f"Output ricevuto:\n```\n{error_feedback}\n```\n"
             )
 
-        for model_name in self.MODELS:
-            print(f"[API] Connessione a: {model_name}")
-            for attempt in range(2):
-                try:
-                    return self.client.models.generate_content(
-                        model=model_name, contents=prompt
-                    ).text
-                except Exception as e:
-                    err = str(e)
-                    if "404" in err:
-                        print(f"[API] Modello {model_name} non disponibile (404), switch.")
-                        break
-                    elif any(x in err for x in ["503", "UNAVAILABLE", "429"]):
-                        if attempt < 1:
-                            print("[API] Server saturo, nuovo tentativo in 5s...")
-                            time.sleep(5)
-                        else:
-                            print(f"[API] Server {model_name} irraggiungibile, switch.")
-                    else:
-                        print(f"[API] Errore su {model_name}: {e}, switch.")
-                        break
-
-        raise Exception("Nessun modello Gemini disponibile. Verificare connessione e API key.")
+        return prompt
 
 
-# ──────────────────────────────────────────────
-# LOGGER TELEMETRIA
-# ──────────────────────────────────────────────
+# ============================================================================
+# LOGGER PER LA TESI
+# ============================================================================
+
+
 class ExperimentLogger:
-    """
-    Modulo passivo di raccolta dati per la fase sperimentale.
-    Separa il tempo netto di chiamata API dal tempo totale di sessione
-    (che include la revisione umana), consentendo un'analisi quantitativa
-    dell'efficienza del ciclo Human-in-the-Loop.
-    """
     LOG_FILE = "thesis_metrics.csv"
 
-    @staticmethod
-    def initialize():
-        if not os.path.exists(ExperimentLogger.LOG_FILE):
-            try:
-                with open(ExperimentLogger.LOG_FILE, mode='w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        "Timestamp", "File Analizzato", "Esito LLM", "Stato Test",
-                        "Passati", "Falliti", "Azione Utente",
-                        "Tempo API (s)", "Tempo Sessione (s)"
-                    ])
-            except Exception:
-                pass
+    @classmethod
+    def initialize(cls, repo_root: Path) -> None:
+        log_path = repo_root / cls.LOG_FILE
+        if log_path.exists():
+            return
 
-    @staticmethod
-    def log_run(target_file, llm_status, test_status, passed, failed,
-                human_action, api_time, session_time):
         try:
-            with open(ExperimentLogger.LOG_FILE, mode='a', newline='', encoding='utf-8') as f:
+            with log_path.open(mode="w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow([
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    os.path.basename(target_file),
-                    llm_status, test_status, passed, failed, human_action,
-                    round(api_time, 2),
-                    round(session_time, 2)
-                ])
+                writer.writerow(
+                    [
+                        "Timestamp",
+                        "File Analizzato",
+                        "Esito LLM",
+                        "Stato Test",
+                        "Passati",
+                        "Falliti",
+                        "Azione Utente",
+                        "Tempo API (s)",
+                        "Tempo Sessione (s)",
+                    ]
+                )
+        except Exception:
+            pass
+
+    @classmethod
+    def log_run(
+        cls,
+        repo_root: Path,
+        target_file: Path,
+        llm_status: str,
+        test_status: str,
+        passed: str,
+        failed: str,
+        human_action: str,
+        api_time: float,
+        session_time: float,
+    ) -> None:
+        try:
+            with (repo_root / cls.LOG_FILE).open(mode="a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        target_file.name,
+                        llm_status,
+                        test_status,
+                        passed,
+                        failed,
+                        human_action,
+                        round(api_time, 2),
+                        round(session_time, 2),
+                    ]
+                )
         except Exception:
             pass
 
 
-# ──────────────────────────────────────────────
-# APP PRINCIPALE
-# ──────────────────────────────────────────────
+# ============================================================================
+# INTERFACCIA GRAFICA E LOGICA PRINCIPALE
+# ============================================================================
+
+
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 
 class GitAgentApp(ctk.CTk):
-
-    def __init__(self):
+    def __init__(self, pre_push_stdin: str):
         super().__init__()
+        self.repo_root = GitManager.get_repo_root()
+        self.git_dir = get_git_dir() or (self.repo_root / ".git")
+        self.pre_push_stdin = pre_push_stdin
+        self.exit_code = 0
+        self._closing = False
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_requested = False
+
         self.title("Git Pre-Push AI Reviewer")
         self.geometry("860x620")
         self.protocol("WM_DELETE_WINDOW", self.bypass_hook)
 
-        self.fixed_code          = ""
-        self.target_file         = ""
+        self.fixed_code = ""
+        self.target_file: Optional[Path] = None
         self.generated_test_code = ""
-        self.test_output_log     = ""
-        self.tests_passed        = "0"
-        self.tests_failed        = "0"
-        self.test_status         = "N/A"
-        self.action_taken        = "Nessuna azione"
-        self._pending_test_file  = ""
+        self.test_output_log = ""
+        self.tests_passed = "0"
+        self.tests_failed = "0"
+        self.test_status = "N/A"
+        self.action_taken = "Nessuna azione"
+        self._current_has_patch = False
 
-        self.user_decision_event  = threading.Event()
+        self._decision_event = threading.Event()
         self.force_push_requested = False
-        self.patched_files_list   = []
+        self.patched_files_list: List[Path] = []
+        self.backup_files: List[Path] = []
 
         self._lock = threading.Lock()
-
-        self._total_files    = 0
+        self._total_files = 0
         self._analyzed_files = 0
-        self._patched_count  = 0
+        self._patched_count = 0
 
-        ExperimentLogger.initialize()
+        ExperimentLogger.initialize(self.repo_root)
         self._build_ui()
+        self.after(100, self._poll_shutdown)
 
-        self.safe_log("Avvio analisi batch commit...")
+        self.safe_log("Avvio analisi dei file inclusi nel push...")
         threading.Thread(target=self.run_agent_logic, daemon=True).start()
 
-    # ── UI ────────────────────────────────────────────────────────────────
-
-    def _build_ui(self):
+    def _build_ui(self) -> None:
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(fill="x", padx=20, pady=(15, 5))
 
         ctk.CTkLabel(
-            header, text="Code Review Automatica",
-            font=ctk.CTkFont(size=20, weight="bold")
+            header,
+            text="Code Review Automatica",
+            font=ctk.CTkFont(size=20, weight="bold"),
         ).pack(side="left")
 
         self.status_label = ctk.CTkLabel(
-            header, text="● In esecuzione",
-            font=ctk.CTkFont(size=13), text_color="#4CAF50"
+            header,
+            text="[in esecuzione]",
+            font=ctk.CTkFont(size=13),
+            text_color="#4CAF50",
         )
         self.status_label.pack(side="right")
 
         self.log_box = ctk.CTkTextbox(
-            self, width=820, height=480, font=("Courier New", 12)
+            self,
+            width=820,
+            height=480,
+            font=("Courier New", 12),
         )
         self.log_box.pack(padx=20, pady=10)
 
-    def safe_log(self, text):
-        self.after(0, lambda: self.log_box.insert("end", text + "\n"))
-        self.after(0, lambda: self.log_box.see("end"))
+    def safe_log(self, text: str) -> None:
+        def append() -> None:
+            if self._closing:
+                return
+            try:
+                self.log_box.insert("end", text + "\n")
+                self.log_box.see("end")
+            except tk.TclError:
+                pass
 
-    def _set_status(self, text, color):
-        self.after(0, lambda: self.status_label.configure(text=text, text_color=color))
+        try:
+            self.after(0, append)
+        except tk.TclError:
+            pass
 
-    def _log_and_exit(self, exit_code, reason=""):
+    def _set_status(self, text: str, color: str) -> None:
+        def update() -> None:
+            try:
+                self.status_label.configure(text=text, text_color=color)
+            except tk.TclError:
+                pass
+
+        try:
+            self.after(0, update)
+        except tk.TclError:
+            pass
+
+    def _request_exit(self, exit_code: int, reason: str = "") -> None:
         if reason:
             print(f"[Sistema] {reason}")
-        self.destroy()
-        os._exit(exit_code)
 
-    def bypass_hook(self):
-        self._log_and_exit(0, "Finestra chiusa. Push originale consentito.")
+        with self._shutdown_lock:
+            if self._shutdown_requested:
+                return
+            self._shutdown_requested = True
+            self.exit_code = exit_code
 
-    # ── Diff Viewer ────────────────────────────────────────────────────────
+        self._decision_event.set()
 
-    def show_diff_viewer(self):
-        """
-        Apre il popup di revisione con tre schede: diff colorato, script di
-        test generato, output dell'esecuzione.
-
-        Gestisce il caso in cui fixed_code sia vuoto (bug rilevato dal test
-        ma nessuna patch generata): mostra un messaggio esplicativo nel tab
-        Diff e disabilita il pulsante Applica, evitando che l'utente rimanga
-        bloccato senza capire cosa sta guardando.
-        """
         try:
-            with open(self.target_file, "r", encoding="utf-8") as f:
-                old_lines = f.readlines()
-        except Exception:
-            old_lines = []
+            self.after(0, self._finish_shutdown)
+        except tk.TclError:
+            pass
 
-        has_patch = bool(self.fixed_code)
-        new_lines = self.fixed_code.splitlines(keepends=True) if has_patch else old_lines
+    def _poll_shutdown(self) -> None:
+        if self._closing:
+            return
 
-        diff_lines = list(difflib.unified_diff(
-            old_lines, new_lines,
-            fromfile="Originale", tofile="Patch AI",
-            n=DIFF_CONTEXT_LINES
-        ))
+        with self._shutdown_lock:
+            requested = self._shutdown_requested
 
-        popup = ctk.CTkToplevel(self)
-        popup.title(f"Review: {os.path.basename(self.target_file)}")
-        popup.geometry("940x820")
-        popup.grab_set()
+        if requested:
+            self._finish_shutdown()
+            return
+
+        try:
+            self.after(100, self._poll_shutdown)
+        except tk.TclError:
+            pass
+
+    def _finish_shutdown(self) -> None:
+        if self._closing:
+            return
+
+        self._closing = True
+        self._decision_event.set()
+
+        try:
+            self.quit()
+        except tk.TclError:
+            pass
+
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+    def _should_stop(self) -> bool:
+        with self._shutdown_lock:
+            return self._shutdown_requested or self._closing
+
+    def bypass_hook(self) -> None:
+        self._request_exit(
+            0,
+            "Finestra chiusa dall'utente. Il push originale proseguira.",
+        )
+
+    # ------------------------------------------------------------------
+    # Diff viewer
+    # ------------------------------------------------------------------
+
+    def show_diff_viewer(self) -> None:
+        try:
+            self._show_diff_viewer_impl()
+        except Exception as exc:
+            self.safe_log(f"[!] Impossibile aprire la revisione visuale: {exc}")
+            with self._lock:
+                self.action_taken = "Errore popup, file saltato"
+            self._decision_event.set()
+
+    def _show_diff_viewer_impl(self) -> None:
+        if not self.target_file:
+            self._decision_event.set()
+            return
+
+        old_text = GitManager._read_text_with_fallback(self.target_file) or ""
+        old_lines = old_text.splitlines(keepends=True)
 
         with self._lock:
+            fixed_code = self.fixed_code
             t_passed = self.tests_passed
             t_failed = self.tests_failed
             t_status = self.test_status
-            t_log    = self.test_output_log
+            t_log = self.test_output_log
+            test_code = self.generated_test_code
 
-        all_passed  = t_failed == "0" and t_status == "Passato"
+        has_patch = bool(fixed_code) and fixed_code != old_text
+        self._current_has_patch = has_patch
+        if not fixed_code:
+            fixed_code = old_text
+
+        new_lines = fixed_code.splitlines(keepends=True)
+        diff_lines = list(
+            difflib.unified_diff(
+                old_lines,
+                new_lines,
+                fromfile="Originale",
+                tofile="Patch AI",
+                n=DIFF_CONTEXT_LINES,
+            )
+        )
+
+        popup = ctk.CTkToplevel(self)
+        popup.title(f"Revisione file: {self.target_file.name}")
+        popup.geometry("940x820")
+        popup.transient(self)
+        popup.grab_set()
+        popup.protocol("WM_DELETE_WINDOW", lambda: self._handle_decision(popup, "skip"))
+
+        all_passed = t_failed == "0" and t_status == "Passato"
         badge_color = "#4CAF50" if all_passed else "#FF6B35"
-        badge_text  = (
-            f"✓ {t_passed} Passati — Patch validata" if all_passed else
-            f"✗ {t_failed} Falliti  |  ✓ {t_passed} Passati — Patch NON validata"
+        badge_text = (
+            f"{t_passed} test passati - patch validata"
+            if all_passed and has_patch
+            else f"{t_passed} passati, {t_failed} falliti - revisione consigliata"
         )
 
         ctk.CTkLabel(
-            popup, text=badge_text,
+            popup,
+            text=badge_text,
             font=ctk.CTkFont(size=15, weight="bold"),
-            text_color=badge_color
+            text_color=badge_color,
         ).pack(pady=(15, 5))
 
         tabs = ctk.CTkTabview(popup, width=900, height=560)
         tabs.pack(pady=5, padx=10)
 
-        tab_diff     = tabs.add("Diff Patch")
-        tab_test     = tabs.add("Script di Test")
-        tab_log_name = "Output Test" + ("" if all_passed else " ⚠")
+        tab_diff = tabs.add("Diff patch")
+        tab_test = tabs.add("Script test")
+        tab_log_name = "Output test" if all_passed else "Output test - attenzione"
         tabs.add(tab_log_name)
 
-        # ── TAB DIFF con colorazione sintattica ─────────────────────────
         diff_frame = ctk.CTkFrame(tab_diff, fg_color="transparent")
         diff_frame.pack(fill="both", expand=True)
 
         txt_diff = tk.Text(
-            diff_frame, font=("Courier New", 11),
-            bg="#1e1e1e", fg="#d4d4d4",
-            insertbackground="white", relief="flat", bd=0, wrap="none"
+            diff_frame,
+            font=("Courier New", 11),
+            bg="#1e1e1e",
+            fg="#d4d4d4",
+            insertbackground="white",
+            relief="flat",
+            bd=0,
+            wrap="none",
         )
-        sb_y = tk.Scrollbar(diff_frame, orient="vertical",   command=txt_diff.yview)
+        sb_y = tk.Scrollbar(diff_frame, orient="vertical", command=txt_diff.yview)
         sb_x = tk.Scrollbar(diff_frame, orient="horizontal", command=txt_diff.xview)
         txt_diff.configure(yscrollcommand=sb_y.set, xscrollcommand=sb_x.set)
-        sb_y.pack(side="right",  fill="y")
+        sb_y.pack(side="right", fill="y")
         sb_x.pack(side="bottom", fill="x")
         txt_diff.pack(fill="both", expand=True)
 
-        txt_diff.tag_configure("added",   background="#1e3a1e", foreground="#6fcf6f")
+        txt_diff.tag_configure("added", background="#1e3a1e", foreground="#6fcf6f")
         txt_diff.tag_configure("removed", background="#3a1e1e", foreground="#f47676")
-        txt_diff.tag_configure("header",  foreground="#569cd6",
-                               font=("Courier New", 11, "bold"))
-        txt_diff.tag_configure("hunk",    foreground="#c586c0")
+        txt_diff.tag_configure("header", foreground="#569cd6", font=("Courier New", 11, "bold"))
+        txt_diff.tag_configure("hunk", foreground="#c586c0")
         txt_diff.tag_configure("neutral", foreground="#9a9a9a")
-        txt_diff.tag_configure("notice",  foreground="#FFA726",
-                               font=("Courier New", 11, "italic"))
+        txt_diff.tag_configure("notice", foreground="#FFA726", font=("Courier New", 11, "italic"))
 
         if diff_lines:
             for line in diff_lines:
@@ -494,539 +847,674 @@ class GitAgentApp(ctk.CTk):
                     txt_diff.insert("end", line, "removed")
                 else:
                     txt_diff.insert("end", line, "neutral")
-        elif has_patch:
-            txt_diff.insert("end", "Nessuna modifica strutturale rilevata.", "neutral")
         else:
-            txt_diff.insert(
-                "end",
-                "Nessuna patch generata dall'AI per questo file.\n\n"
-                "Il test ha rilevato dei fallimenti ma l'AI non ha prodotto\n"
-                "una versione corretta del codice. Controlla la scheda\n"
-                "'Output Test' per i dettagli e valuta se procedere con\n"
-                "il push o scartare.",
-                "notice"
+            msg = (
+                "L'AI non ha proposto modifiche al file target.\n\n"
+                "Puoi leggere il test e l'output per capire se serve un controllo manuale."
             )
+            txt_diff.insert("end", msg, "notice")
 
         txt_diff.configure(state="disabled")
 
-        # ── TAB SCRIPT DI TEST ──────────────────────────────────────────
         txt_test = ctk.CTkTextbox(tab_test, width=880, height=500, font=("Courier New", 11))
         txt_test.pack(fill="both", expand=True)
-        txt_test.insert("0.0", self.generated_test_code or "Script di test non generato.")
+        txt_test.insert("0.0", test_code or "Script di test non generato.")
 
-        # ── TAB OUTPUT TEST ─────────────────────────────────────────────
-        tab_log_widget = tabs.tab(tab_log_name)
-        txt_log = ctk.CTkTextbox(tab_log_widget, width=880, height=500, font=("Courier New", 11))
+        txt_log = ctk.CTkTextbox(
+            tabs.tab(tab_log_name),
+            width=880,
+            height=500,
+            font=("Courier New", 11),
+        )
         txt_log.pack(fill="both", expand=True)
-        txt_log.insert("0.0", t_log if t_log else "Nessun output disponibile.")
+        txt_log.insert("0.0", t_log or "Nessun output disponibile.")
 
         if not all_passed:
             tabs.set(tab_log_name)
 
-        # ── Pulsanti ────────────────────────────────────────────────────
         btn_frame = ctk.CTkFrame(popup, fg_color="transparent")
         btn_frame.pack(pady=15)
 
-        apply_label = "✔ Applica Patch"  if (all_passed and has_patch) else "⚠ Applica (non validata)"
-        apply_color = "#2e7d32"          if (all_passed and has_patch) else "#b8860b"
-        apply_hover = "#1b5e20"          if (all_passed and has_patch) else "#8b6508"
-        apply_state = "normal" if has_patch else "disabled"
+        apply_label = "Applica patch" if has_patch else "Nessuna patch da applicare"
+        apply_color = "#2e7d32" if all_passed and has_patch else "#8a6d1d"
 
         ctk.CTkButton(
-            btn_frame, text=apply_label,
-            fg_color=apply_color, hover_color=apply_hover, width=190,
+            btn_frame,
+            text=apply_label,
+            fg_color=apply_color,
+            hover_color="#1b5e20" if all_passed and has_patch else "#6f5614",
+            width=220,
             command=lambda: self._handle_decision(popup, "queue"),
-            state=apply_state
         ).pack(side="left", padx=10)
 
         ctk.CTkButton(
-            btn_frame, text="✖ Scarta",
-            fg_color="#795500", hover_color="#5c3d00", width=120,
-            command=lambda: self._handle_decision(popup, "skip")
+            btn_frame,
+            text="Scarta",
+            fg_color="#795500",
+            hover_color="#5c3d00",
+            width=120,
+            command=lambda: self._handle_decision(popup, "skip"),
         ).pack(side="left", padx=10)
 
         ctk.CTkButton(
-            btn_frame, text="⚡ Forza Push",
-            fg_color="#b71c1c", hover_color="#7f0000", width=140,
-            command=lambda: self._handle_decision(popup, "force")
+            btn_frame,
+            text="Forza push",
+            fg_color="#b71c1c",
+            hover_color="#7f0000",
+            width=140,
+            command=lambda: self._handle_decision(popup, "force"),
         ).pack(side="right", padx=10)
 
-    def _handle_decision(self, popup, decision):
+    def _handle_decision(self, popup: ctk.CTkToplevel, decision: str) -> None:
         if decision == "queue":
-            abs_path = os.path.abspath(self.target_file)
-            try:
-                shutil.copy2(abs_path, abs_path + ".bak")
-                with open(abs_path, "w", encoding="utf-8") as f:
-                    f.write(self.fixed_code)
-                self.patched_files_list.append(abs_path)
-                with self._lock:
-                    self.action_taken   = "Patch Applicata"
-                    self._patched_count += 1
-                self.safe_log(f"[+] Patch applicata: {os.path.basename(abs_path)}")
-            except Exception as e:
-                self.safe_log(f"[!] Errore scrittura patch: {e}")
-
+            self._apply_current_patch()
         elif decision == "skip":
             with self._lock:
                 self.action_taken = "Scartato"
-            self.safe_log(f"[-] Patch ignorata: {os.path.basename(self.target_file)}")
-
+            if self.target_file:
+                self.safe_log(f"[-] Modifiche scartate per: {self.target_file.name}")
         elif decision == "force":
             self.force_push_requested = True
             with self._lock:
-                self.action_taken = "Forza Push"
-            self.safe_log("[!] Forza push richiesto dall'utente.")
+                self.action_taken = "Forza push"
+            self.safe_log("[!] Forza push richiesto. Le analisi successive saranno saltate.")
 
-        # Pulizia file di test FUORI dal lock: os.remove è I/O bloccante
-        # e tenere il lock occupato durante I/O causa deadlock su Windows.
-        pending = self._pending_test_file
-        with self._lock:
-            self._pending_test_file = ""
-        if pending:
-            self._cleanup_test_file(pending)
-
-        popup.destroy()
-        self.user_decision_event.set()
-
-    # ── Logica agente ──────────────────────────────────────────────────────
-
-    def run_agent_logic(self):
         try:
-            api_key = resolve_api_key()
+            popup.destroy()
+        except tk.TclError:
+            pass
+
+        self._decision_event.set()
+
+    def _apply_current_patch(self) -> None:
+        if not self.target_file:
+            return
+
+        if not self._current_has_patch:
+            with self._lock:
+                self.action_taken = "Nessuna patch applicabile"
+            self.safe_log("[i] Nessuna patch applicabile: il file rimane invariato.")
+            return
+
+        abs_path = self.target_file.resolve()
+        try:
+            backup_dir = self.git_dir / "ai_agent_backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = backup_dir / f"{int(time.time())}_{abs_path.name}.bak"
+            shutil.copy2(abs_path, backup_path)
+
+            abs_path.write_text(self.fixed_code, encoding="utf-8")
+            self.patched_files_list.append(abs_path)
+            self.backup_files.append(backup_path)
+
+            with self._lock:
+                self.action_taken = "Patch applicata"
+                self._patched_count += 1
+
+            self.safe_log(f"[+] Patch salvata su disco per: {abs_path.name}")
+        except Exception as exc:
+            with self._lock:
+                self.action_taken = "Errore scrittura patch"
+            self.safe_log(f"[!] Impossibile scrivere la patch: {exc}")
+
+    # ------------------------------------------------------------------
+    # Logica principale
+    # ------------------------------------------------------------------
+
+    def run_agent_logic(self) -> None:
+        try:
+            api_key = resolve_api_key(self.repo_root)
             if not api_key:
                 self.safe_log("[!] API key non trovata.")
-                self.safe_log("    1. export GOOGLE_API_KEY=la_tua_chiave")
-                self.safe_log("    2. File .api_key nella root del repo")
-                self.safe_log("       (aggiungi .api_key al .gitignore!)")
-                self.safe_log("    Push autorizzato senza analisi.")
+                self.safe_log("    Usa GOOGLE_API_KEY oppure un file .api_key nella root del repository.")
+                self.safe_log("    Il push viene autorizzato senza analisi.")
                 time.sleep(2)
-                return self._log_and_exit(0)
+                return self._request_exit(0)
 
-            target_files = GitManager.get_modified_files()
-            valid_ext    = ('.py', '.dart', '.swift', '.js', '.ts',
-                            '.java', '.cpp', '.c', '.cs')
-            target_files = [f for f in target_files if f.endswith(valid_ext)]
+            target_files = GitManager.get_files_changed_by_push(self.pre_push_stdin)
+
+            if len(target_files) > MAX_FILES_TO_ANALYZE:
+                self.safe_log(
+                    f"[!] Rilevati {len(target_files)} file. "
+                    f"Analizzo solo i primi {MAX_FILES_TO_ANALYZE}."
+                )
+                target_files = target_files[:MAX_FILES_TO_ANALYZE]
 
             if not target_files:
-                self.safe_log("Nessun file sorgente modificato. Push autorizzato.")
+                self.safe_log("Nessun file sorgente rilevante nel push. Push autorizzato.")
                 time.sleep(1)
-                return self._log_and_exit(0)
+                return self._request_exit(0)
 
             self._total_files = len(target_files)
-            self._set_status(f"● Analisi ({self._total_files} file)", "#FFA726")
+            self._set_status(f"[analisi: {self._total_files} file]", "#FFA726")
             ai_client = GenAIClient(api_key)
 
             for idx, file_path in enumerate(target_files, start=1):
-                if self.force_push_requested:
+                if self.force_push_requested or self._should_stop():
                     break
 
                 self.target_file = file_path
-                base_name        = os.path.basename(file_path)
-                api_time         = 0.0
-                file_start       = time.time()
+                api_time = 0.0
+                file_start = time.time()
 
-                self.safe_log(f"\n{'─' * 50}")
-                self.safe_log(f"[{idx}/{self._total_files}] Analisi: {base_name}")
+                self.safe_log("\n" + "=" * 60)
+                self.safe_log(f"[{idx}/{self._total_files}] Analisi file: {file_path.name}")
 
-                # Reset stato per questo file.
-                # Fatto una sola volta qui (non ad ogni tentativo) per non perdere
-                # la patch generata in un tentativo precedente nel caso in cui
-                # il tentativo successivo produca solo il test corretto.
-                with self._lock:
-                    self.tests_passed        = "0"
-                    self.tests_failed        = "0"
-                    self.test_status         = "N/A"
-                    self.test_output_log     = ""
-                    self.action_taken        = "Nessuna azione"
-                    self.fixed_code          = ""
-                    self.generated_test_code = ""
-                    self._pending_test_file  = ""
+                size_check = GitManager.is_file_too_large(file_path)
+                if size_check.too_large:
+                    self.safe_log(f"  [!] File saltato: {size_check.reason}.")
+                    ExperimentLogger.log_run(
+                        self.repo_root,
+                        file_path,
+                        "Saltato per dimensione",
+                        "N/A",
+                        "0",
+                        "0",
+                        "Saltato automaticamente",
+                        0.0,
+                        round(time.time() - file_start, 2),
+                    )
+                    continue
 
+                self._reset_file_state()
                 error_feedback = ""
-                bug_confirmed  = False
+                bug_or_risk_found = False
+                llm_status = "Non conclusivo"
 
                 for attempt in range(MAX_RETRY_ATTEMPTS):
-                    self.safe_log(f"  Tentativo {attempt + 1}/{MAX_RETRY_ATTEMPTS}...")
+                    if self._should_stop():
+                        break
 
-                    t0   = time.time()
-                    resp = self._fetch_ai_response(ai_client, file_path, error_feedback)
+                    self.safe_log(
+                        f"  [Iterazione {attempt + 1}/{MAX_RETRY_ATTEMPTS}] "
+                        "Richiesta analisi AI..."
+                    )
+
+                    t0 = time.time()
+                    response_text = self._fetch_ai_response(ai_client, file_path, error_feedback)
                     api_time += time.time() - t0
 
-                    if not resp:
-                        self.safe_log("  [!] Nessuna risposta dall'AI.")
+                    if not response_text:
+                        self.safe_log("  [!] Risposta AI vuota.")
+                        llm_status = "Risposta vuota"
                         break
 
-                    result, err_log = self._handle_ai_response(resp)
+                    result, err_log = self._handle_ai_response(response_text)
 
-                    if result == "confirmed":
-                        bug_confirmed = True
-                        with self._lock:
-                            p, fa = self.tests_passed, self.tests_failed
-                        self.safe_log(f"  Test eseguiti: {p} passati, {fa} falliti.")
-                        break
-                    elif result == "clean":
-                        self.safe_log("  Nessun bug rilevato dall'AI. ✓")
-                        break
-                    elif result == "failed":
+                    if result == "bug":
+                        bug_or_risk_found = True
+                        llm_status = "Bug o rischio segnalato"
                         self.safe_log(
-                            f"  Crash del test (tentativo {attempt + 1}). "
-                            f"Invio feedback all'AI..."
+                            f"  [test] Passed: {self.tests_passed} | Failed: {self.tests_failed}"
                         )
-                        error_feedback = err_log or "Esecuzione fallita senza output."
-                    else:
-                        self.safe_log("  Risposta AI non strutturata correttamente.")
                         break
+
+                    if result == "clean":
+                        llm_status = "Nessun bug"
+                        self.safe_log("  [ok] Nessuna criticita logica segnalata.")
+                        break
+
+                    if result == "failed":
+                        llm_status = "Test non eseguibile"
+                        error_feedback = err_log or "Esecuzione fallita senza output utile."
+                        self.safe_log("  [!] Test non eseguibile. Invio feedback all'AI.")
+                        continue
+
+                    llm_status = "Formato non valido"
+                    error_feedback = err_log or (
+                        "La risposta AI non rispetta il formato richiesto: "
+                        "mancano metadati o blocchi di test validi."
+                    )
+                    self.safe_log("  [!] Risposta AI incompleta. Invio feedback all'AI.")
+                    continue
 
                 self._analyzed_files += 1
 
-                needs_review = bug_confirmed or self.test_status == "Fallito"
+                if self._should_stop():
+                    break
+
+                needs_review = bug_or_risk_found or self.test_status == "Fallito"
                 if needs_review:
-                    self.safe_log("  → Revisione utente richiesta.")
-                    # Pulizia preventiva dell'evento prima di aspettare:
-                    # se fosse rimasto settato da una sessione precedente,
-                    # wait() uscirebbe immediatamente senza aspettare la
-                    # decisione dell'utente sul file corrente.
-                    self.user_decision_event.clear()
+                    self.safe_log("  [review] Richiesta decisione manuale.")
+                    self._decision_event.clear()
                     self.after(0, self.show_diff_viewer)
-                    self.user_decision_event.wait()
+                    self._decision_event.wait()
+                    if self._should_stop():
+                        break
                 else:
-                    pending = self._pending_test_file
-                    with self._lock:
-                        self._pending_test_file = ""
-                    if pending:
-                        self._cleanup_test_file(pending)
-                    self.safe_log("  ✓ File validato, nessun problema.")
+                    self.safe_log("  [ok] File concluso senza interventi.")
 
-                # session_time misurato DOPO wait() per includere il tempo di
-                # revisione umana, metrica chiave del ciclo Human-in-the-Loop.
                 session_time = round(time.time() - file_start, 2)
-
                 with self._lock:
                     ExperimentLogger.log_run(
-                        file_path, "Processato", self.test_status,
-                        self.tests_passed, self.tests_failed,
+                        self.repo_root,
+                        file_path,
+                        llm_status,
+                        self.test_status,
+                        self.tests_passed,
+                        self.tests_failed,
                         self.action_taken,
-                        round(api_time, 2), session_time
+                        round(api_time, 2),
+                        session_time,
                     )
 
-            self.safe_log(f"\n{'─' * 50}")
+            self.safe_log("\n" + "=" * 60)
             self._finalize()
 
-        except Exception as e:
-            self.safe_log(f"\n[Eccezione critica] {e}")
+        except Exception as exc:
+            self.safe_log(f"\n[Eccezione interna] {exc}")
             time.sleep(2)
-            self._log_and_exit(0)
+            self._request_exit(0)
 
-    def _finalize(self):
+    def _reset_file_state(self) -> None:
+        with self._lock:
+            self.tests_passed = "0"
+            self.tests_failed = "0"
+            self.test_status = "N/A"
+            self.test_output_log = ""
+            self.action_taken = "Nessuna azione"
+            self.fixed_code = ""
+            self.generated_test_code = ""
+            self._current_has_patch = False
+
+    def _finalize(self) -> None:
         if self.force_push_requested:
-            self.safe_log("Forza push attivo. Push originale ripristinato.")
-            self._set_status("● Forza Push", "#FF6B35")
+            self.safe_log("Forza push attivo. Il push originale viene autorizzato.")
+            self._set_status("[push forzato]", "#FF6B35")
             time.sleep(2)
-            return self._log_and_exit(0)
+            return self._request_exit(0)
 
-        self.safe_log(
-            f"Riepilogo: {self._total_files} file totali | "
-            f"{self._analyzed_files} analizzati | "
-            f"{self._patched_count} patch applicate"
-        )
+        changed_files = [
+            path for path in self.patched_files_list
+            if path.exists() and GitManager.has_worktree_changes(path, self.repo_root)
+        ]
 
-        for f in self.patched_files_list:
-            bak = f + ".bak"
-            if os.path.exists(bak):
-                try:
-                    os.remove(bak)
-                except Exception:
-                    pass
-
-        if self.patched_files_list:
-            # Verifica che i file patchati esistano ancora prima di aggiungerli
-            existing = [f for f in self.patched_files_list if os.path.exists(f)]
-            missing  = [f for f in self.patched_files_list if not os.path.exists(f)]
-            for m in missing:
-                self.safe_log(f"  [!] File non trovato, escluso: {os.path.basename(m)}")
-
-            if existing:
-                self.safe_log(f"Aggiornamento commit per {len(existing)} file patchati...")
-
-                add_res = subprocess.run(
-                    ['git', 'add'] + existing,
-                    capture_output=True, text=True
-                )
-                if add_res.returncode != 0:
-                    self.safe_log(f"  [!] Errore git add: {add_res.stderr.strip()}")
-
-                amend_res = subprocess.run(
-                    ['git', 'commit', '--amend', '--no-edit'],
-                    capture_output=True, text=True
-                )
-                if amend_res.returncode != 0:
-                    self.safe_log(f"  [!] Errore git commit --amend: {amend_res.stderr.strip()}")
-                    self.safe_log("  Il push viene bloccato. Risolvi manualmente e riprova.")
-                    time.sleep(4)
-                    return self._log_and_exit(1)
-
-                set_bypass_flag()
-                self._set_status("● Completato", "#4CAF50")
-                self.safe_log("✅ Commit aggiornato con le patch.")
-                self.safe_log("👉 Esegui nuovamente 'git push' per inviare il codice corretto.")
-                time.sleep(4)
-                return self._log_and_exit(1)
-
-        self._set_status("● OK", "#4CAF50")
-        self.safe_log("✅ Nessuna patch applicata. Push originale autorizzato.")
-        time.sleep(2)
-        self._log_and_exit(0)
-
-    # ── Metodi privati ─────────────────────────────────────────────────────
-
-    def _fetch_ai_response(self, ai_client, target_file, error_feedback=""):
-        source_code  = GitManager.read_files([target_file])
-        context_code = GitManager.read_files(GitManager.get_context_files(target_file))
-        try:
-            return ai_client.analyze_code(
-                target_file, source_code, context_code, error_feedback
+        if changed_files:
+            self.safe_log(
+                f"Riepilogo: {self._total_files} file considerati, "
+                f"{self._analyzed_files} analizzati, {self._patched_count} patch applicate."
             )
-        except Exception as e:
-            self.safe_log(f"  [!] Errore API: {e}")
+            self.safe_log(f"Creo un commit separato per {len(changed_files)} file patchati.")
+
+            rel_paths = [to_git_path(path, self.repo_root) for path in changed_files]
+            commit_msg = f"Auto-patch AI: correzioni su {len(changed_files)} file"
+
+            commit_res = run_process(
+                ["git", "commit", "--only", "-m", commit_msg, "--"] + rel_paths,
+                cwd=self.repo_root,
+            )
+
+            if commit_res.returncode != 0:
+                self.safe_log("[!] Commit automatico non riuscito.")
+                self.safe_log(commit_res.stderr.strip() or commit_res.stdout.strip())
+                self.safe_log("    Il push viene bloccato per permettere un controllo manuale.")
+                time.sleep(4)
+                return self._request_exit(1)
+
+            set_bypass_flag()
+            self._cleanup_backups()
+            self._set_status("[validazione terminata]", "#4CAF50")
+            self.safe_log("Commit automatico creato correttamente.")
+            self.safe_log("Riesegui git push: il bypass temporaneo evita un doppio controllo immediato.")
+            time.sleep(4)
+            return self._request_exit(1)
+
+        self._cleanup_backups()
+        self.safe_log(
+            f"Riepilogo: {self._total_files} file considerati, "
+            f"{self._analyzed_files} analizzati, nessuna patch salvata."
+        )
+        self._set_status("[validazione ok]", "#4CAF50")
+        self.safe_log("Validazione conclusa. Push autorizzato.")
+        time.sleep(2)
+        return self._request_exit(0)
+
+    # ------------------------------------------------------------------
+    # Parsing risposta AI e test
+    # ------------------------------------------------------------------
+
+    def _fetch_ai_response(
+        self,
+        ai_client: GenAIClient,
+        target_file: Path,
+        error_feedback: str = "",
+    ) -> Optional[str]:
+        source_code = GitManager.read_files([target_file], self.repo_root)
+        context_code = GitManager.read_files(
+            GitManager.get_context_files(target_file),
+            self.repo_root,
+        )
+        try:
+            return ai_client.analyze_code(target_file, source_code, context_code, error_feedback)
+        except Exception as exc:
+            self.safe_log(f"  [!] Errore API: {exc}")
             return None
 
-    def _handle_ai_response(self, response_text):
-        """
-        Interpreta la risposta AI ed estrae patch e metadati del test.
+    def _handle_ai_response(self, response_text: str) -> Tuple[str, str]:
+        no_bug = bool(re.search(r"\bnessun\s+bug\b", response_text, re.IGNORECASE))
 
-        Il reset di fixed_code NON avviene qui: viene fatto una sola volta
-        per file in run_agent_logic, in modo che la patch generata in un
-        tentativo precedente rimanga disponibile anche se il tentativo
-        successivo (destinato a correggere il test) non la ripete.
-
-        Ritorna: ("confirmed"|"clean"|"failed"|"unclear", log_errore)
-        """
-        match_code = re.search(
-            r"##\s*codice corretto.*?```[^\n]*\n(.*?)\n```",
-            response_text, re.DOTALL | re.IGNORECASE
-        )
-        if match_code:
+        fixed_code = self._extract_block_after_heading(response_text, r"codice\s+corretto")
+        if fixed_code and not no_bug:
             with self._lock:
-                self.fixed_code = match_code.group(1).strip()
+                self.fixed_code = fixed_code.strip()
 
-        cmd_match    = re.search(r"RUN_COMMAND:\s*(.*)",     response_text, re.IGNORECASE)
-        t_file_match = re.search(r"TEST_FILE_NAME:\s*(\S+)", response_text, re.IGNORECASE)
-        no_bug       = re.search(r"nessun bug",              response_text, re.IGNORECASE)
+        cmd = self._extract_metadata(response_text, "RUN_COMMAND")
+        t_file = self._extract_metadata(response_text, "TEST_FILE_NAME")
 
-        if no_bug:
-            if cmd_match and t_file_match:
-                return self._run_tests(
-                    response_text,
-                    cmd_match.group(1).strip(),
-                    t_file_match.group(1).strip()
-                )
-            with self._lock:
-                self.test_status = "N/A"
-            return "clean", ""
-
-        if cmd_match and t_file_match:
-            return self._run_tests(
-                response_text,
-                cmd_match.group(1).strip(),
-                t_file_match.group(1).strip()
+        if not cmd or not t_file:
+            return (
+                "failed",
+                "Risposta AI incompleta: mancano TEST_FILE_NAME e/o RUN_COMMAND.",
             )
 
-        return "unclear", ""
+        run_result, err_log = self._run_tests(response_text, cmd, t_file)
 
-    def _run_tests(self, response_text, cmd, t_file):
-        """
-        Scrive ed esegue lo script di test generato dall'AI.
+        if no_bug:
+            if run_result == "passed":
+                return "clean", ""
+            return "failed", err_log
 
-        Classificazione del risultato:
-        - returncode == 0                      → tutti i test passano  → "confirmed"
-        - returncode != 0 + output strutturato → bug reali nel codice  → "confirmed"
-          (il viewer mostra i fallimenti per la revisione umana)
-        - returncode != 0 + nessun output      → crash del test stesso → "failed"
-          (il log viene mandato all'AI per correggere lo script)
-        - timeout superato                     → possibile loop infinito → "failed"
+        if run_result in ("passed", "structured_failed"):
+            return "bug", ""
 
-        Il file di test viene salvato in _pending_test_file e rimosso
-        in _handle_decision() DOPO che l'utente ha chiuso il viewer,
-        in modo che rimanga leggibile nella scheda Script di Test.
-        """
-        blocks = re.findall(r"```[^\n]*\n(.*?)\n```", response_text, re.DOTALL)
+        return "failed", err_log
+
+    @staticmethod
+    def _extract_metadata(response_text: str, key: str) -> Optional[str]:
+        match = re.search(rf"^{re.escape(key)}:\s*(.+)$", response_text, re.IGNORECASE | re.MULTILINE)
+        return match.group(1).strip() if match else None
+
+    @staticmethod
+    def _extract_block_after_heading(response_text: str, heading_pattern: str) -> Optional[str]:
+        heading = re.search(rf"##\s*{heading_pattern}.*?$", response_text, re.IGNORECASE | re.MULTILINE)
+        if not heading:
+            return None
+
+        block = re.search(r"```[^\n]*\n(.*?)\n```", response_text[heading.end():], re.DOTALL)
+        return block.group(1) if block else None
+
+    def _extract_test_block(self, response_text: str) -> Optional[str]:
+        unit_heading = re.search(r"##\s*unit\s+test.*?$", response_text, re.IGNORECASE | re.MULTILINE)
+        if unit_heading:
+            block = re.search(r"```[^\n]*\n(.*?)\n```", response_text[unit_heading.end():], re.DOTALL)
+            if block:
+                return block.group(1).strip()
+
+        blocks = [
+            (m.start(), m.group(1).strip())
+            for m in re.finditer(r"```[^\n]*\n(.*?)\n```", response_text, re.DOTALL)
+        ]
         if not blocks:
-            return "unclear", ""
+            return None
 
-        test_code = blocks[-1].strip()
+        meta_match = re.search(r"^TEST_FILE_NAME:", response_text, re.IGNORECASE | re.MULTILINE)
+        if meta_match:
+            before_meta = [item for item in blocks if item[0] < meta_match.start()]
+            if before_meta:
+                return before_meta[-1][1]
 
-        # Pulizia difensiva: rimuove metadati che l'AI include a volte nel blocco codice
+        return blocks[-1][1]
+
+    def _run_tests(self, response_text: str, cmd: str, t_file_name: str) -> Tuple[str, str]:
+        test_code = self._extract_test_block(response_text)
+        if not test_code:
+            return "failed", "Blocco UNIT TEST non trovato nella risposta AI."
+
         test_code = re.sub(
-            r"(?im)^(DEPENDENCIES|TEST_FILE_NAME|RUN_COMMAND):.*$", "", test_code
+            r"(?im)^(DEPENDENCIES|TEST_FILE_NAME|RUN_COMMAND):.*$",
+            "",
+            test_code,
         ).strip()
 
-        # Correzione automatica: import sys mancante quando il test usa sys.exit
         if "sys.exit" in test_code and "import sys" not in test_code:
             test_code = "import sys\n" + test_code
+
+        safe_name = self._safe_test_file_name(t_file_name)
+        test_path = self._make_temp_test_path(safe_name)
+
+        try:
+            test_path.write_text(test_code, encoding="utf-8")
+        except Exception as exc:
+            return "failed", f"Impossibile scrivere il test: {exc}"
 
         with self._lock:
             self.generated_test_code = test_code
 
-        try:
-            with open(t_file, "w", encoding="utf-8") as f:
-                f.write(test_code)
-        except Exception as e:
-            return "failed", str(e)
-
-        with self._lock:
-            self._pending_test_file = t_file
-
-        target_ext = os.path.splitext(self.target_file)[1]
-        exec_cmd   = cmd
-
-        if cmd.startswith("pytest"):
-            exec_cmd = f"{sys.executable} -m {cmd}"
-        elif cmd.startswith("python"):
-            exec_cmd = f"{sys.executable} {t_file}"
-        elif target_ext == ".swift":
-            result, exec_cmd = self._compile_swift(t_file)
-            if result == "failed":
-                self._cleanup_test_file(t_file)
-                with self._lock:
-                    self._pending_test_file = ""
-                return "failed", exec_cmd
+        exec_args, setup_error, cleanup_paths = self._build_test_command(cmd, test_path, safe_name)
+        if setup_error:
+            self._cleanup_test_file(test_path)
+            with self._lock:
+                self.test_status = "Fallito"
+                self.test_output_log = setup_error
+            return "failed", setup_error
 
         try:
-            res = subprocess.run(
-                exec_cmd, shell=True,
-                capture_output=True, text=True, timeout=30
+            res = run_process(
+                exec_args,
+                cwd=self.repo_root,
+                timeout=TEST_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
-            timeout_msg = "Timeout: esecuzione test superata (30s). Possibile loop infinito."
-            self._cleanup_test_file(t_file)
+            msg = f"Timeout: il test ha superato {TEST_TIMEOUT_SECONDS} secondi."
+            self._cleanup_test_file(test_path)
             with self._lock:
-                self._pending_test_file = ""
-                self.test_status        = "Fallito"
-                self.test_output_log    = timeout_msg
-            return "failed", timeout_msg
+                self.test_status = "Fallito"
+                self.test_output_log = msg
+            return "failed", msg
+        except Exception as exc:
+            msg = f"Esecuzione test non riuscita: {exc}"
+            self._cleanup_test_file(test_path)
+            with self._lock:
+                self.test_status = "Fallito"
+                self.test_output_log = msg
+            return "failed", msg
+        finally:
+            for path in cleanup_paths:
+                self._cleanup_test_file(path)
+            self._cleanup_test_file(test_path)
 
         out_text = (res.stdout + "\n" + res.stderr).strip()
-
         m_pass = re.search(r"Passed:\s*(\d+)", out_text, re.IGNORECASE)
         m_fail = re.search(r"Failed:\s*(\d+)", out_text, re.IGNORECASE)
+        has_metrics = bool(m_pass and m_fail)
 
         with self._lock:
             self.test_output_log = out_text
-            self.tests_passed    = m_pass.group(1) if m_pass else "0"
-            self.tests_failed    = m_fail.group(1) if m_fail else "0"
+            self.tests_passed = m_pass.group(1) if m_pass else "0"
+            self.tests_failed = m_fail.group(1) if m_fail else "0"
 
-        if target_ext == ".swift":
-            exe = "TestExe.exe" if os.name == 'nt' else "TestExe"
-            try:
-                os.remove(exe)
-            except Exception:
-                pass
-
-        has_structured_output = bool(m_pass or m_fail)
-
-        if res.returncode == 0:
-            with self._lock:
-                self.test_status = "Passato"
-            return "confirmed", ""
-
-        if has_structured_output:
-            # Il test è stato eseguito correttamente e ha trovato bug reali nel codice.
-            # Va mostrato all'utente per la revisione, non rimandato all'AI.
+        if not has_metrics:
+            msg = out_text or "Il test non ha stampato Passed/Failed nel formato richiesto."
             with self._lock:
                 self.test_status = "Fallito"
-            return "confirmed", ""
+            return "failed", msg
 
-        # Crash sintattico o errore di import nello script di test.
-        # Il log viene mandato all'AI per correggere il test stesso.
+        if res.returncode == 0 and self.tests_failed == "0":
+            with self._lock:
+                self.test_status = "Passato"
+            return "passed", ""
+
         with self._lock:
             self.test_status = "Fallito"
+        return "structured_failed", ""
 
-        self._cleanup_test_file(t_file)
-        with self._lock:
-            self._pending_test_file = ""
+    def _safe_test_file_name(self, name: str) -> str:
+        base = Path(name.strip().strip('"').strip("'")).name
+        base = re.sub(r"[^A-Za-z0-9_.-]", "_", base)
 
-        err = res.stderr.strip() or res.stdout.strip() or "Exit code non zero, nessun output."
-        return "failed", err
+        if not base or "." not in base:
+            ext = ".py"
+            if self.target_file:
+                ext = {
+                    ".js": ".js",
+                    ".ts": ".js",
+                    ".dart": ".dart",
+                    ".swift": ".swift",
+                }.get(self.target_file.suffix.lower(), ".py")
+            base = f"test_ai_fix{ext}"
 
-    def _cleanup_test_file(self, t_file):
+        return base
+
+    def _make_temp_test_path(self, safe_name: str) -> Path:
+        """
+        Crea il test temporaneo nella root del repo.
+
+        In questo modo Python/Node risolvono gli import come farebbe un test
+        lanciato manualmente dal progetto, senza modificare PYTHONPATH.
+        Il file viene rimosso subito dopo l'esecuzione.
+        """
+        return self.repo_root / f".ai_agent_test_{uuid.uuid4().hex}_{safe_name}"
+
+    def _build_test_command(
+        self,
+        cmd: str,
+        test_path: Path,
+        safe_name: str,
+    ) -> Tuple[List[str], str, List[Path]]:
+        if not self.target_file:
+            return [], "File target non impostato.", []
+
+        target_ext = self.target_file.suffix.lower()
+        tokens = self._split_command(cmd)
+        if not tokens:
+            return [], "RUN_COMMAND vuoto.", []
+
+        executable = Path(tokens[0]).name.lower()
+
+        if target_ext == ".py" or executable in ("python", "python3", "py"):
+            return [sys.executable, str(test_path)], "", []
+
+        if target_ext in (".js", ".ts") or executable == "node":
+            return ["node", str(test_path)], "", []
+
+        if target_ext == ".dart" or executable == "dart":
+            return ["dart", str(test_path)], "", []
+
+        if target_ext == ".swift":
+            return self._compile_swift(test_path)
+
+        allowed = {"java", "javac", "dotnet"}
+        if executable not in allowed:
+            return [], f"Comando non consentito per sicurezza: {cmd}", []
+
+        normalized = [str(test_path) if Path(tok).name == safe_name else tok for tok in tokens]
+        if str(test_path) not in normalized:
+            return [], "Il comando di test non fa riferimento al file generato.", []
+
+        return normalized, "", []
+
+    @staticmethod
+    def _split_command(cmd: str) -> List[str]:
         try:
-            if t_file and os.path.exists(t_file):
-                os.remove(t_file)
+            return shlex.split(cmd, posix=(os.name != "nt"))
+        except ValueError:
+            return []
+
+    def _compile_swift(self, test_path: Path) -> Tuple[List[str], str, List[Path]]:
+        if not self.target_file:
+            return [], "File target non impostato.", []
+
+        target_dir = self.target_file.parent
+        swift_files = sorted(str(path) for path in target_dir.glob("*.swift"))
+        test_abs = str(test_path.resolve())
+        if test_abs not in swift_files:
+            swift_files.append(test_abs)
+
+        exe = self.git_dir / "ai_agent_tests" / ("TestExe.exe" if os.name == "nt" else "TestExe")
+        comp = run_process(["swiftc"] + swift_files + ["-o", str(exe)], cwd=self.repo_root)
+        if comp.returncode != 0:
+            return [], comp.stderr.strip() or comp.stdout.strip(), []
+
+        return [str(exe)], "", [exe]
+
+    def _cleanup_test_file(self, t_file: Optional[Path]) -> None:
+        if not t_file:
+            return
+        try:
+            if t_file.exists():
+                t_file.unlink()
         except Exception:
             pass
 
-    def _compile_swift(self, t_file):
-        """Compila i file Swift nella directory target insieme al test generato."""
-        target_dir  = os.path.dirname(os.path.abspath(self.target_file))
-        swift_files = [
-            os.path.join(target_dir, f)
-            for f in os.listdir(target_dir) if f.endswith('.swift')
-        ]
-        abs_t = os.path.abspath(t_file)
-        if abs_t not in swift_files:
-            swift_files.append(abs_t)
-
-        exe     = "TestExe.exe" if os.name == 'nt' else "TestExe"
-        cmd_str = " ".join(f'"{f}"' for f in swift_files)
-        comp    = subprocess.run(
-            f"swiftc {cmd_str} -o {exe}",
-            shell=True, capture_output=True, text=True
-        )
-        if comp.returncode != 0:
-            return "failed", comp.stderr.strip()
-        return "ok", f"./{exe}" if os.name != 'nt' else exe
+    def _cleanup_backups(self) -> None:
+        for path in self.backup_files:
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
 
 
-# ──────────────────────────────────────────────
+# ============================================================================
 # INSTALLAZIONE HOOK
-# ──────────────────────────────────────────────
-def install_hook():
+# ============================================================================
+
+
+def install_hook() -> None:
     root = tk.Tk()
     root.withdraw()
-    target_dir = filedialog.askdirectory(title="Seleziona la root del repository Git")
+    target_dir = filedialog.askdirectory(
+        title="Seleziona la root del repository Git da controllare"
+    )
 
     if not target_dir:
         sys.exit(1)
 
-    hooks_dir = os.path.join(target_dir, ".git", "hooks")
-    if not os.path.exists(hooks_dir):
+    hooks_dir = Path(target_dir) / ".git" / "hooks"
+    if not hooks_dir.exists():
         print("Errore: directory .git/hooks non trovata.")
         sys.exit(1)
 
-    pre_push_path = os.path.join(hooks_dir, "pre-push")
-    script_path   = os.path.abspath(__file__).replace("\\", "/")
-    python_exe    = sys.executable.replace("\\", "/")
+    pre_push_path = hooks_dir / "pre-push"
+    script_path = Path(__file__).resolve().as_posix()
+    python_exe = Path(sys.executable).resolve().as_posix()
 
     bash_hook = f'#!/bin/sh\n"{python_exe}" "{script_path}"\nexit $?\n'
-    try:
-        with open(pre_push_path, "w", encoding="utf-8") as f:
-            f.write(bash_hook)
-        current = os.stat(pre_push_path).st_mode
-        os.chmod(pre_push_path, current | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
-        print("✅ Hook pre-push installato correttamente.")
-        print(f"   Percorso: {pre_push_path}\n")
-        print("Configurazione API key (scegli uno dei metodi):")
-        print("  1. export GOOGLE_API_KEY=la_tua_chiave        # Linux/macOS")
-        print("     set GOOGLE_API_KEY=la_tua_chiave           # Windows CMD\n")
-        print("  2. File .api_key nella root del repository:")
-        print("     echo 'la_tua_chiave' > .api_key")
-        print("     echo '.api_key' >> .gitignore   # non committare la chiave!")
-    except Exception as e:
-        print(f"Errore installazione: {e}")
+    try:
+        pre_push_path.write_text(bash_hook, encoding="utf-8")
+        current_mode = pre_push_path.stat().st_mode
+        pre_push_path.chmod(current_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+        print("Hook pre-push installato correttamente.")
+        print(f"Percorso: {pre_push_path}")
+        print("")
+        print("Configurazione API key:")
+        print("  export GOOGLE_API_KEY=la_tua_chiave")
+        print("  oppure crea un file .api_key nella root del repository")
+        print("  e aggiungi .api_key al .gitignore.")
+    except Exception as exc:
+        print(f"Installazione hook non riuscita: {exc}")
+        sys.exit(1)
+
     sys.exit(0)
 
 
-# ──────────────────────────────────────────────
+# ============================================================================
 # ENTRY POINT
-# ──────────────────────────────────────────────
-if __name__ == "__main__":
+# ============================================================================
+
+
+def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--install":
         install_hook()
-    else:
-        if check_and_clear_bypass():
-            print("[Agente AI] Bypass attivo — push in esecuzione senza analisi.")
-            sys.exit(0)
+        return 0
 
-        app = GitAgentApp()
-        app.mainloop()
+    if check_and_clear_bypass():
+        print("[Agente AI] Bypass temporaneo riconosciuto. Push autorizzato.")
+        return 0
+
+    pre_push_stdin = ""
+    try:
+        if not sys.stdin.closed:
+            pre_push_stdin = sys.stdin.read()
+    except Exception:
+        pre_push_stdin = ""
+
+    app = GitAgentApp(pre_push_stdin)
+    app.mainloop()
+    return app.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
