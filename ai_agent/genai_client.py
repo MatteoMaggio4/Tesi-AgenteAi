@@ -1,4 +1,4 @@
-﻿import time
+import time
 from pathlib import Path
 
 from google import genai
@@ -97,7 +97,8 @@ class GenAIClient:
             "9. Non inventare requisiti non presenti nel codice o nella docstring del file target.\n"
             "10. Non ridefinire nel test classi o funzioni gia presenti nel file target: usa direttamente quelle fornite.\n"
             "11. Non usare assert dentro lambda: in Python e SyntaxError. Definisci una funzione normale per ogni assert.\n"
-            "12. Non proporre comandi distruttivi o comandi che non eseguono il test.\n\n"
+            "12. Non catturare o sostituire sys.stdout e non usare StringIO: stampa direttamente su console.\n"
+            "13. Non proporre comandi distruttivi o comandi che non eseguono il test.\n\n"
             "Concludi sempre fuori dai blocchi di codice con:\n"
             "DEPENDENCIES: NONE\n"
             "TEST_FILE_NAME: <nome_file_test>\n"

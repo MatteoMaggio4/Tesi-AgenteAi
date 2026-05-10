@@ -38,7 +38,7 @@ class TestRunnerMixin:
     def _run_tests(self, response_text: str, cmd: str, t_file_name: str) -> Tuple[str, str]:
         test_code = self._extract_test_block(response_text)
         if not test_code:
-            return "failed", "Blocco UNIT TEST non trovato nella risposta AI."
+            return self._record_test_failure("Blocco UNIT TEST non trovato nella risposta AI.")
 
         test_code = re.sub(
             r"(?im)^(DEPENDENCIES|TEST_FILE_NAME|RUN_COMMAND):.*$",
@@ -51,11 +51,15 @@ class TestRunnerMixin:
 
         syntax_error = self._validate_python_test_syntax(test_code)
         if syntax_error:
-            return "failed", syntax_error
+            return self._record_test_failure(syntax_error)
+
+        stdout_error = self._find_stdout_capture(test_code)
+        if stdout_error:
+            return self._record_test_failure(stdout_error)
 
         shadow_error = self._find_shadowed_target_symbols(test_code)
         if shadow_error:
-            return "failed", shadow_error
+            return self._record_test_failure(shadow_error)
 
         test_code = self._prepare_python_test_code(test_code)
 
@@ -65,7 +69,7 @@ class TestRunnerMixin:
         try:
             test_path.write_text(test_code, encoding="utf-8")
         except Exception as exc:
-            return "failed", f"Impossibile scrivere il test: {exc}"
+            return self._record_test_failure(f"Impossibile scrivere il test: {exc}")
 
         with self._lock:
             self.generated_test_code = test_code
@@ -125,6 +129,7 @@ class TestRunnerMixin:
             msg = out_text or "Il test non ha stampato Passed/Failed nel formato richiesto."
             with self._lock:
                 self.test_status = "Fallito"
+                self.test_output_log = msg
             return "failed", msg
 
         if res.returncode == 0 and self.tests_failed == "0":
@@ -136,6 +141,7 @@ class TestRunnerMixin:
             msg = out_text or "Il test ha stampato metriche positive ma e terminato con errore."
             with self._lock:
                 self.test_status = "Fallito"
+                self.test_output_log = msg
             return "failed", msg
 
         with self._lock:
@@ -154,6 +160,21 @@ class TestRunnerMixin:
                 f"({location}: {exc.msg}). Correggi il test usando funzioni normali; "
                 "non usare assert dentro lambda."
             )
+    @staticmethod
+    def _find_stdout_capture(test_code: str) -> str:
+        blocked_patterns = (
+            "sys.stdout =",
+            "sys.stdout=",
+            "sys.stdout.getvalue",
+            "StringIO(",
+            "from io import StringIO",
+        )
+        if any(pattern in test_code for pattern in blocked_patterns):
+            return (
+                "Test non valido: non catturare o sostituire sys.stdout. "
+                "Stampa direttamente su console le righe [PASS], [FAIL], Passed e Failed."
+            )
+        return ""
     def _find_shadowed_target_symbols(self, test_code: str) -> str:
         if not self.target_file or self.target_file.suffix.lower() != ".py":
             return ""
