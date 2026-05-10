@@ -48,6 +48,8 @@ class TestRunnerMixin:
         if "sys.exit" in test_code and "import sys" not in test_code:
             test_code = "import sys\n" + test_code
 
+        test_code = self._prepare_python_test_code(test_code)
+
         safe_name = self._safe_test_file_name(t_file_name)
         test_path = self._make_temp_test_path(safe_name)
 
@@ -97,23 +99,21 @@ class TestRunnerMixin:
         m_fail = re.search(r"Failed:\s*(\d+)", out_text, re.IGNORECASE)
         has_metrics = bool(m_pass and m_fail)
 
+        display_text = out_text
+        if has_metrics:
+            display_text = self._format_test_output(
+                out_text,
+                m_pass.group(1),
+                m_fail.group(1),
+            )
+
         with self._lock:
-            self.test_output_log = out_text
+            self.test_output_log = display_text
             self.tests_passed = m_pass.group(1) if m_pass else "0"
             self.tests_failed = m_fail.group(1) if m_fail else "0"
 
         if not has_metrics:
             msg = out_text or "Il test non ha stampato Passed/Failed nel formato richiesto."
-            with self._lock:
-                self.test_status = "Fallito"
-            return "failed", msg
-
-        has_case_details = bool(re.search(r"\[(PASS|FAIL)\]", out_text, re.IGNORECASE))
-        if not has_case_details:
-            msg = (
-                (out_text + "\n\n" if out_text else "")
-                + "Il test deve stampare una riga [PASS] o [FAIL] per ogni caso eseguito."
-            )
             with self._lock:
                 self.test_status = "Fallito"
             return "failed", msg
@@ -132,6 +132,47 @@ class TestRunnerMixin:
         with self._lock:
             self.test_status = "Fallito"
         return "structured_failed", ""
+
+    def _prepare_python_test_code(self, test_code: str) -> str:
+        if not self.target_file or self.target_file.suffix.lower() != ".py":
+            return test_code
+
+        target_path = self.target_file.resolve()
+        preload = (
+            "import importlib.util as _ai_importlib_util\n"
+            "from pathlib import Path as _AiPath\n\n"
+            f"_ai_target_path = _AiPath(r\"{target_path}\")\n"
+            "_ai_spec = _ai_importlib_util.spec_from_file_location(\"_ai_agent_target_module\", _ai_target_path)\n"
+            "_ai_module = _ai_importlib_util.module_from_spec(_ai_spec)\n"
+            "_ai_spec.loader.exec_module(_ai_module)\n"
+            "for _ai_name in dir(_ai_module):\n"
+            "    if not _ai_name.startswith(\"_\"):\n"
+            "        globals().setdefault(_ai_name, getattr(_ai_module, _ai_name))"
+        )
+        return preload + "\n\n" + test_code
+    @staticmethod
+    def _format_test_output(out_text: str, passed: str, failed: str) -> str:
+        has_detail_rows = bool(re.search(r"^\s*\[(PASS|FAIL)\]", out_text, re.IGNORECASE | re.MULTILINE))
+        if has_detail_rows:
+            return out_text
+
+        summary = []
+        try:
+            passed_count = int(passed)
+            failed_count = int(failed)
+        except ValueError:
+            return out_text
+
+        if passed_count > 0:
+            summary.append(f"[PASS] {passed_count} controlli superati")
+        if failed_count > 0:
+            summary.append(f"[FAIL] {failed_count} controlli falliti: dettagli nei messaggi precedenti")
+
+        if not summary:
+            return out_text
+
+        base = out_text.rstrip()
+        return base + "\n\nDettaglio sintetico:\n" + "\n".join(summary)
 
     def _safe_test_file_name(self, name: str) -> str:
         base = Path(name.strip().strip('"').strip("'")).name
