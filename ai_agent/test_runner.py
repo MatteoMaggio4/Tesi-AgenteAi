@@ -2,6 +2,7 @@ import ast
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import uuid
@@ -46,68 +47,123 @@ class TestRunnerMixin:
             test_code,
         ).strip()
 
-        is_python_target = bool(self.target_file and self.target_file.suffix.lower() == ".py")
-        if is_python_target:
-            if "sys.exit" in test_code and "import sys" not in test_code:
-                test_code = "import sys\n" + test_code
+        if not self.target_file:
+            return self._record_test_failure("File target non impostato.")
 
-            syntax_error = self._validate_python_test_syntax(test_code)
-            if syntax_error:
-                return self._record_test_failure(syntax_error)
+        target_ext = self.target_file.suffix.lower()
+        if target_ext == ".py":
+            test_code = self._prepare_python_test_code_for_execution(test_code)
+            if isinstance(test_code, tuple):
+                return test_code
 
-            stdout_error = self._find_stdout_capture(test_code)
-            if stdout_error:
-                return self._record_test_failure(stdout_error)
+        guard_error = self._find_unreliable_test_code(test_code, target_ext)
+        if guard_error:
+            return self._record_test_failure(guard_error)
 
-            shadow_error = self._find_shadowed_target_symbols(test_code)
-            if shadow_error:
-                return self._record_test_failure(shadow_error)
-
-            test_code = self._prepare_python_test_code(test_code)
         safe_name = self._safe_test_file_name(t_file_name)
-        test_path = self._make_temp_test_path(safe_name)
 
+        with self._lock:
+            self.generated_test_code = test_code
+
+        if target_ext == ".java":
+            return self._run_java_test(test_code, safe_name)
+
+        test_path = self._make_temp_test_path(safe_name)
         try:
             test_path.write_text(test_code, encoding="utf-8")
         except Exception as exc:
             return self._record_test_failure(f"Impossibile scrivere il test: {exc}")
 
-        with self._lock:
-            self.generated_test_code = test_code
-
         exec_args, setup_error, cleanup_paths = self._build_test_command(cmd, test_path, safe_name)
         if setup_error:
             self._cleanup_test_file(test_path)
-            with self._lock:
-                self.test_status = "Fallito"
-                self.test_output_log = setup_error
-            return "failed", setup_error
+            return self._record_test_failure(setup_error)
 
         try:
-            res = run_process(
-                exec_args,
-                cwd=self.repo_root,
-                timeout=TEST_TIMEOUT_SECONDS,
-            )
+            res = run_process(exec_args, cwd=self.repo_root, timeout=TEST_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             msg = f"Timeout: il test ha superato {TEST_TIMEOUT_SECONDS} secondi."
             self._cleanup_test_file(test_path)
-            with self._lock:
-                self.test_status = "Fallito"
-                self.test_output_log = msg
-            return "failed", msg
+            return self._record_test_failure(msg)
         except Exception as exc:
             msg = f"Esecuzione test non riuscita: {exc}"
             self._cleanup_test_file(test_path)
-            with self._lock:
-                self.test_status = "Fallito"
-                self.test_output_log = msg
-            return "failed", msg
+            return self._record_test_failure(msg)
         finally:
             for path in cleanup_paths:
-                self._cleanup_test_file(path)
+                self._cleanup_path(path)
             self._cleanup_test_file(test_path)
 
+        return self._handle_test_process_result(res)
+
+    def _prepare_python_test_code_for_execution(self, test_code: str):
+        if "sys.exit" in test_code and "import sys" not in test_code:
+            test_code = "import sys\n" + test_code
+
+        syntax_error = self._validate_python_test_syntax(test_code)
+        if syntax_error:
+            return self._record_test_failure(syntax_error)
+
+        stdout_error = self._find_stdout_capture(test_code)
+        if stdout_error:
+            return self._record_test_failure(stdout_error)
+
+        shadow_error = self._find_shadowed_target_symbols(test_code)
+        if shadow_error:
+            return self._record_test_failure(shadow_error)
+
+        return self._prepare_python_test_code(test_code)
+
+    def _run_java_test(self, test_code: str, safe_name: str) -> Tuple[str, str]:
+        if not self.target_file:
+            return self._record_test_failure("File target non impostato.")
+
+        class_name = self._extract_java_public_class(test_code) or Path(safe_name).stem
+        if not re.match(r"^[A-Za-z_$][A-Za-z0-9_$]*$", class_name):
+            class_name = "AiAgentTest"
+
+        temp_dir = self.repo_root / f".ai_agent_java_{uuid.uuid4().hex}"
+        test_path = temp_dir / f"{class_name}.java"
+        try:
+            temp_dir.mkdir(parents=True, exist_ok=False)
+            test_path.write_text(test_code, encoding="utf-8")
+
+            compile_res = run_process(
+                [
+                    "javac",
+                    "-encoding",
+                    "UTF-8",
+                    "-d",
+                    str(temp_dir),
+                    str(self.target_file.resolve()),
+                    str(test_path),
+                ],
+                cwd=self.repo_root,
+                timeout=TEST_TIMEOUT_SECONDS,
+            )
+            if compile_res.returncode != 0:
+                output = (compile_res.stdout + "\n" + compile_res.stderr).strip()
+                return self._record_test_failure(output or "Compilazione Java non riuscita.")
+
+            run_res = run_process(
+                ["java", "-cp", str(temp_dir), class_name],
+                cwd=self.repo_root,
+                timeout=TEST_TIMEOUT_SECONDS,
+            )
+            return self._handle_test_process_result(run_res)
+        except subprocess.TimeoutExpired:
+            return self._record_test_failure(f"Timeout: il test ha superato {TEST_TIMEOUT_SECONDS} secondi.")
+        except Exception as exc:
+            return self._record_test_failure(f"Esecuzione test Java non riuscita: {exc}")
+        finally:
+            self._cleanup_path(temp_dir)
+
+    @staticmethod
+    def _extract_java_public_class(test_code: str) -> Optional[str]:
+        match = re.search(r"\bpublic\s+class\s+([A-Za-z_$][A-Za-z0-9_$]*)", test_code)
+        return match.group(1) if match else None
+
+    def _handle_test_process_result(self, res: subprocess.CompletedProcess) -> Tuple[str, str]:
         out_text = (res.stdout + "\n" + res.stderr).strip()
         m_pass = re.search(r"Passed:\s*(\d+)", out_text, re.IGNORECASE)
         m_fail = re.search(r"Failed:\s*(\d+)", out_text, re.IGNORECASE)
@@ -115,11 +171,7 @@ class TestRunnerMixin:
 
         display_text = out_text
         if has_metrics:
-            display_text = self._format_test_output(
-                out_text,
-                m_pass.group(1),
-                m_fail.group(1),
-            )
+            display_text = self._format_test_output(out_text, m_pass.group(1), m_fail.group(1))
 
         with self._lock:
             self.test_output_log = display_text
@@ -128,10 +180,7 @@ class TestRunnerMixin:
 
         if not has_metrics:
             msg = out_text or "Il test non ha stampato Passed/Failed nel formato richiesto."
-            with self._lock:
-                self.test_status = "Fallito"
-                self.test_output_log = msg
-            return "failed", msg
+            return self._record_test_failure(msg)
 
         if res.returncode == 0 and self.tests_failed == "0":
             with self._lock:
@@ -140,14 +189,19 @@ class TestRunnerMixin:
 
         if self.tests_failed == "0":
             msg = out_text or "Il test ha stampato metriche positive ma e terminato con errore."
-            with self._lock:
-                self.test_status = "Fallito"
-                self.test_output_log = msg
-            return "failed", msg
+            return self._record_test_failure(msg)
 
         with self._lock:
             self.test_status = "Fallito"
-        return "structured_failed", ""
+        return "structured_failed", display_text
+
+    def _record_test_failure(self, message: str) -> Tuple[str, str]:
+        with self._lock:
+            self.test_status = "Fallito"
+            self.test_output_log = message
+            self.tests_passed = "0"
+            self.tests_failed = "0"
+        return "failed", message
 
     @staticmethod
     def _validate_python_test_syntax(test_code: str) -> str:
@@ -161,6 +215,7 @@ class TestRunnerMixin:
                 f"({location}: {exc.msg}). Correggi il test usando funzioni normali; "
                 "non usare assert dentro lambda."
             )
+
     @staticmethod
     def _find_stdout_capture(test_code: str) -> str:
         blocked_patterns = (
@@ -176,6 +231,37 @@ class TestRunnerMixin:
                 "Stampa direttamente su console le righe [PASS], [FAIL], Passed e Failed."
             )
         return ""
+
+    @staticmethod
+    def _find_unreliable_test_code(test_code: str, target_ext: str) -> str:
+        lowered = test_code.lower()
+        blocked_fragments = (
+            "system.out.tostring()",
+            "manual analysis",
+            "based on manual",
+            "assumo che",
+            "simuliamo il conteggio",
+            "non posso catturare",
+            "expected outcomes for demonstration",
+            "hardcoded",
+            "valori manualmente",
+        )
+        if any(fragment in lowered for fragment in blocked_fragments):
+            return (
+                "Test non valido: i contatori Passed/Failed devono essere calcolati "
+                "durante l'esecuzione reale, non impostati o giustificati manualmente."
+            )
+
+        if target_ext in (".java", ".js", ".ts"):
+            suspicious_assignments = (
+                r"passed\w*\s*=\s*\d+\s*;\s*(?://|/\*).*manual",
+                r"failed\w*\s*=\s*0\s*;\s*(?://|/\*).*manual",
+            )
+            if any(re.search(pattern, test_code, re.IGNORECASE) for pattern in suspicious_assignments):
+                return "Test non valido: i contatori finali non devono essere hardcoded."
+
+        return ""
+
     def _find_shadowed_target_symbols(self, test_code: str) -> str:
         if not self.target_file or self.target_file.suffix.lower() != ".py":
             return ""
@@ -225,6 +311,7 @@ class TestRunnerMixin:
             "        globals().setdefault(_ai_name, getattr(_ai_module, _ai_name))"
         )
         return preload + "\n\n" + test_code
+
     @staticmethod
     def _format_test_output(out_text: str, passed: str, failed: str) -> str:
         has_detail_rows = bool(re.search(r"^\s*\[(PASS|FAIL)\]", out_text, re.IGNORECASE | re.MULTILINE))
@@ -261,19 +348,13 @@ class TestRunnerMixin:
                     ".ts": ".js",
                     ".dart": ".dart",
                     ".swift": ".swift",
+                    ".java": ".java",
                 }.get(self.target_file.suffix.lower(), ".py")
             base = f"test_ai_fix{ext}"
 
         return base
 
     def _make_temp_test_path(self, safe_name: str) -> Path:
-        """
-        Crea il test temporaneo nella root del repo.
-
-        In questo modo Python/Node risolvono gli import come farebbe un test
-        lanciato manualmente dal progetto, senza modificare PYTHONPATH.
-        Il file viene rimosso subito dopo l'esecuzione.
-        """
         return self.repo_root / f".ai_agent_test_{uuid.uuid4().hex}_{safe_name}"
 
     def _build_test_command(
@@ -304,7 +385,7 @@ class TestRunnerMixin:
         if target_ext == ".swift":
             return self._compile_swift(test_path)
 
-        allowed = {"java", "javac", "dotnet"}
+        allowed = {"dotnet"}
         if executable not in allowed:
             return [], f"Comando non consentito per sicurezza: {cmd}", []
 
@@ -347,11 +428,17 @@ class TestRunnerMixin:
         except Exception:
             pass
 
+    def _cleanup_path(self, path: Optional[Path]) -> None:
+        if not path:
+            return
+        try:
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            elif path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
     def _cleanup_backups(self) -> None:
         for path in self.backup_files:
-            try:
-                if path.exists():
-                    path.unlink()
-            except Exception:
-                pass
-
+            self._cleanup_path(path)

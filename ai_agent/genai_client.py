@@ -1,7 +1,11 @@
+import queue
+import threading
 import time
 from pathlib import Path
 
 from google import genai
+
+from .config import API_TIMEOUT_SECONDS
 
 
 class GenAIClient:
@@ -23,13 +27,13 @@ class GenAIClient:
             print(f"[API] Connessione al modello: {model_name}")
             for attempt in range(2):
                 try:
-                    response = self.client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                    )
+                    response = self._generate_content(model_name, prompt)
                     return response.text or ""
                 except Exception as exc:
                     err = str(exc)
+                    if isinstance(exc, TimeoutError):
+                        print(f"[API] Timeout su {model_name} dopo {API_TIMEOUT_SECONDS} secondi.")
+                        break
                     if "404" in err:
                         print(f"[API] Modello non disponibile: {model_name}.")
                         break
@@ -47,6 +51,31 @@ class GenAIClient:
         raise RuntimeError(
             "Nessun modello Gemini disponibile. Controllare connessione e API key."
         )
+
+    def _generate_content(self, model_name: str, prompt: str):
+        result_queue: queue.Queue = queue.Queue(maxsize=1)
+
+        def worker() -> None:
+            try:
+                response = self.client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
+                result_queue.put(("ok", response))
+            except Exception as exc:
+                result_queue.put(("error", exc))
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        try:
+            status, payload = result_queue.get(timeout=API_TIMEOUT_SECONDS)
+        except queue.Empty as exc:
+            raise TimeoutError from exc
+
+        if status == "error":
+            raise payload
+        return payload
 
     @staticmethod
     def _build_prompt(
@@ -95,19 +124,22 @@ class GenAIClient:
             "7. Per verificare eccezioni o errori usa costrutti espliciti del linguaggio target.",
             "8. Non inventare requisiti non presenti nel codice o nella docstring/commenti del file target.",
             "9. Non ridefinire nel test classi, funzioni o tipi gia presenti nel file target: usa direttamente il codice reale da validare.",
+            "10. Non impostare manualmente i contatori finali: Passed e Failed devono derivare dai casi eseguiti.",
+            "11. Non usare frasi o commenti come manual analysis, assumo, simuliamo il conteggio o valori manuali.",
+            "12. Non usare operatori di shell come &&, || o ; nel RUN_COMMAND: indica un comando diretto e semplice.",
         ]
         if is_python:
             test_rules.extend(
                 [
-                    "10. Vincoli specifici Python: niente unittest, pytest, classi di test o decorator.",
-                    "11. Vincoli specifici Python: non usare assert dentro lambda; in Python e SyntaxError.",
-                    "12. Vincoli specifici Python: non catturare o sostituire sys.stdout e non usare StringIO; stampa direttamente su console.",
-                    "13. Vincoli specifici Python: non mescolare argomenti posizionali dopo keyword argument.",
-                    "14. Non proporre comandi distruttivi o comandi che non eseguono il test.",
+                    "13. Vincoli specifici Python: niente unittest, pytest, classi di test o decorator.",
+                    "14. Vincoli specifici Python: non usare assert dentro lambda; in Python e SyntaxError.",
+                    "15. Vincoli specifici Python: non catturare o sostituire sys.stdout e non usare StringIO; stampa direttamente su console.",
+                    "16. Vincoli specifici Python: non mescolare argomenti posizionali dopo keyword argument.",
+                    "17. Non proporre comandi distruttivi o comandi che non eseguono il test.",
                 ]
             )
         else:
-            test_rules.append("10. Non proporre comandi distruttivi o comandi che non eseguono il test.")
+            test_rules.append("13. Non proporre comandi distruttivi o comandi che non eseguono il test.")
 
         prompt = (
             "Sei un revisore automatico di codice per un progetto universitario.\n"

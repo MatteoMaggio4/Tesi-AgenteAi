@@ -40,6 +40,16 @@ class ResponseParserMixin:
                 return "clean", ""
             return "failed", err_log
 
+        if candidate_code:
+            if run_result == "passed":
+                with self._lock:
+                    self.fixed_code = candidate_code
+                return "bug", ""
+            with self._lock:
+                self.fixed_code = ""
+            details = err_log or self.test_output_log or "La patch proposta non ha superato la validazione locale."
+            return "failed", details
+
         if run_result in ("passed", "structured_failed"):
             return "bug", ""
 
