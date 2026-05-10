@@ -140,6 +140,13 @@ class GenAIClient:
             )
         else:
             test_rules.append("13. Non proporre comandi distruttivi o comandi che non eseguono il test.")
+            if target_ext == ".java":
+                test_rules.extend(
+                    [
+                        "14. Vincoli specifici Java: la classe di test deve contenere una sola public static void main(String[] args).",
+                        "15. Vincoli specifici Java: non duplicare il metodo main e non inserire codice fuori dalla classe pubblica.",
+                    ]
+                )
 
         prompt = (
             "Sei un revisore automatico di codice per un progetto universitario.\n"

@@ -122,10 +122,16 @@ class ReviewDialogMixin:
                 else:
                     txt_diff.insert("end", line, "neutral")
         else:
-            msg = (
-                "L'AI non ha proposto modifiche al file target.\n\n"
-                "Puoi leggere il test e l'output per capire se serve un controllo manuale."
-            )
+            if t_status == "Fallito":
+                msg = (
+                    "La patch non e disponibile perche non ha superato la validazione locale.\n\n"
+                    "Puoi leggere il test e l'output per capire se serve un controllo manuale."
+                )
+            else:
+                msg = (
+                    "L'AI non ha proposto modifiche al file target.\n\n"
+                    "Puoi leggere il test e l'output per capire se serve un controllo manuale."
+                )
             txt_diff.insert("end", msg, "notice")
 
         txt_diff.configure(state="disabled")

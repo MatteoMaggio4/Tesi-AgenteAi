@@ -55,6 +55,10 @@ class TestRunnerMixin:
             test_code = self._prepare_python_test_code_for_execution(test_code)
             if isinstance(test_code, tuple):
                 return test_code
+        elif target_ext == ".java":
+            java_error = self._validate_java_test_structure(test_code)
+            if java_error:
+                return self._record_test_failure(java_error)
 
         guard_error = self._find_unreliable_test_code(test_code, target_ext)
         if guard_error:
@@ -162,6 +166,21 @@ class TestRunnerMixin:
     def _extract_java_public_class(test_code: str) -> Optional[str]:
         match = re.search(r"\bpublic\s+class\s+([A-Za-z_$][A-Za-z0-9_$]*)", test_code)
         return match.group(1) if match else None
+
+    @staticmethod
+    def _validate_java_test_structure(test_code: str) -> str:
+        main_count = len(
+            re.findall(
+                r"\bpublic\s+static\s+void\s+main\s*\(\s*String\s*\[\]\s+\w+\s*\)",
+                test_code,
+            )
+        )
+        if main_count > 1:
+            return (
+                "Test Java non valido: la classe di test contiene piu metodi main. "
+                "Genera una sola public static void main(String[] args) e chiama li tutti i casi."
+            )
+        return ""
 
     def _handle_test_process_result(self, res: subprocess.CompletedProcess) -> Tuple[str, str]:
         out_text = (res.stdout + "\n" + res.stderr).strip()

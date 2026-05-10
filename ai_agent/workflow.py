@@ -207,7 +207,11 @@ class AgentWorkflowMixin:
             self._cleanup_backups()
             self._set_status("[validazione terminata]", "#4CAF50")
             self.safe_log("Commit automatico creato correttamente.")
-            self.safe_log("Riesegui git push: il bypass temporaneo evita un doppio controllo immediato.")
+            self.safe_log(
+                "Attendi la chiusura automatica della finestra: il push corrente deve "
+                "essere bloccato per completare il flusso in modo corretto."
+            )
+            self.safe_log("Poi riesegui git push: il bypass temporaneo evita un doppio controllo immediato.")
             time.sleep(4)
             return self._request_exit(1)
 
